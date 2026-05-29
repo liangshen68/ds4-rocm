@@ -1610,6 +1610,7 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
+#ifdef DS4_CUDA_SPARK_HBM_CACHE
 typedef struct {
     uint64_t off;
     uint64_t end;
@@ -1700,6 +1701,7 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     if (cached_out) *cached_out = cached;
     return true;
 }
+#endif
 
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend != DS4_BACKEND_CUDA) return true;
@@ -1708,9 +1710,13 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
         return true;
     }
 
+#ifdef DS4_CUDA_SPARK_HBM_CACHE
     const double t0 = now_sec();
     uint64_t cached = 0;
     if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+#else
+    uint64_t cached = 0;
+#endif
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -1727,6 +1733,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
             }
         }
     }
+#ifdef DS4_CUDA_SPARK_HBM_CACHE
     if (cached != 0) {
         const double t1 = now_sec();
         if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
@@ -1735,6 +1742,9 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
                 (double)cached / 1073741824.0,
                 t1 - t0);
     }
+#else
+    (void)cached;
+#endif
     return true;
 }
 #else

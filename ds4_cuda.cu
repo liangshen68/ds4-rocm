@@ -1540,6 +1540,14 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+#ifndef DS4_CUDA_SPARK_HBM_CACHE
+    (void)model_map;
+    (void)model_size;
+    (void)offset;
+    (void)bytes;
+    (void)label;
+    return 1;
+#else
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     /* Startup walk: force-populate the device-resident HBM cache so hot
@@ -1558,6 +1566,7 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
         if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 1;
     }
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what) != NULL;
+#endif
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
