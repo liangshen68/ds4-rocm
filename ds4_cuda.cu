@@ -3596,7 +3596,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
 }
 
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
-__global__ __launch_bounds__(256, 4) static void attention_indexed_mixed_heads8_online_kernel(
+__global__ static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
@@ -3761,7 +3761,7 @@ __global__ __launch_bounds__(256, 4) static void attention_indexed_mixed_heads8_
     }
 }
 
-__global__ __launch_bounds__(256, 4) static void attention_static_mixed_heads8_online_kernel(
+__global__ static void attention_static_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
@@ -3885,7 +3885,7 @@ __global__ __launch_bounds__(256, 4) static void attention_static_mixed_heads8_o
     }
 }
 
-__global__ __launch_bounds__(256, 4) static void attention_decode_mixed_heads8_online_kernel(
+__global__ static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
