@@ -20,6 +20,21 @@ CORE_OBJS = ds4.o ds4_distributed.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
+CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
+METAL_LDLIBS := $(LDLIBS)
+
+ifeq ($(GPU_BACKEND),rocm)
+# ROCm / HIP toolchain for AMD GPUs (e.g. gfx1151 Strix Halo).
+ROCM_PATH ?= /opt/rocm
+ROCM_ARCH ?= gfx1151
+NVCC := $(ROCM_PATH)/bin/hipcc
+NVCCFLAGS ?= -O3 -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ \
+             -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+CUDA_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
+EXTRA_DEPS = ds4_rocm.h
+else
+# NVIDIA / CUDA toolchain (default).
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
@@ -27,13 +42,13 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-METAL_LDLIBS := $(LDLIBS)
+EXTRA_DEPS =
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+endif
+
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -77,9 +92,17 @@ help:
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
+	@echo "  make rocm ROCM_ARCH=A    Build ROCm/HIP for AMD GPU arch A (default gfx1151)"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
+
+rocm:
+	@if [ -z "$(strip $(ROCM_ARCH))" ]; then \
+		echo "error: specify ROCM_ARCH, for example: make rocm ROCM_ARCH=gfx1151"; \
+		exit 2; \
+	fi
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent GPU_BACKEND=rocm ROCM_ARCH="$(ROCM_ARCH)"
 
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
@@ -184,7 +207,7 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(EXTRA_DEPS)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
