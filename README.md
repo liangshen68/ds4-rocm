@@ -1,3 +1,58 @@
+# DwarfStar (ds4) — ROCm / gfx1151 fork
+
+> **This fork** ports DwarfStar's CUDA backend to AMD **ROCm/HIP** and
+> tunes it for the **Radeon 8060S** integrated GPU on **AMD Strix Halo**
+> (gfx1151, RDNA 3.5). It tracks `antirez/ds4@main` rather than the
+> (older, hand-rebased) `antirez/ds4@rocm` branch so it stays in sync
+> with upstream feature development (PRO Q4 path, agent, eval, kvstore,
+> indexer kernels, etc).
+>
+> Upstream is **NVIDIA-only** on main. This fork's contribution is:
+>
+> 1. A drop-in HIP shim (`ds4_rocm.h`) that maps the CUDA runtime,
+>    cuBLAS, `nvcuda::wmma`, and `cub::` namespaces to hipBLAS, rocWMMA,
+>    and hipCUB. `__dp4a` reaches gfx1151's `v_dot4_i32_iu8` via
+>    `__builtin_amdgcn_sudot4` (single VALU op vs ~7 in the byte fallback).
+>
+> 2. A new `make rocm ROCM_ARCH=gfx1151` Makefile target.
+>
+> 3. Profile-driven kernel tuning targeted at Strix Halo's 40 CUs / 64 KB
+>    LDS / wave32 budget — measured **+46 % generation throughput** on a
+>    no-context Redis Streams prompt (8.78 → 12.85 t/s) vs the
+>    unoptimized HIP port. Long-context details below.
+>
+> Validated on Strix Halo (Radeon 8060S, 96 GB unified memory, ROCm 7.2,
+> HIP 7.2.53211) against the DeepSeek V4 Flash IQ2_XXS model.
+> Upstream main targets and the Metal/CUDA paths are untouched.
+
+**Quickstart on gfx1151:**
+
+```bash
+git clone https://github.com/liangshen68/ds4-rocm
+cd ds4-rocm
+make rocm ROCM_ARCH=gfx1151     # builds ds4, ds4-server, ds4-bench, ds4-eval, ds4-agent
+
+# Inference
+./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+      -p "Explain Redis streams in one paragraph."
+# typical: prefill ~28 t/s, generation ~12.8 t/s on a 96 GB Strix Halo
+
+# Long-context speed bench (32 frontiers, 2K → 64K context)
+./ds4-bench -m gguf/<MODEL>.gguf --prompt-file speed-bench/promessi_sposi.txt \
+            --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128
+```
+
+For other AMD GPUs (`gfx1100` discrete RDNA3, `gfx1030` RDNA2, etc.) the
+build will likely succeed but the `__launch_bounds__` numbers and the
+F16-pair coalescing tradeoff were tuned to Strix Halo's wave32 / 40 CU /
+64 KB LDS budget — re-profile before depending on the numbers.
+
+See **[gfx1151 port and optimization details](#amd-rocm--strix-halo-gfx1151--port-and-optimization-details)**
+at the bottom of this README for the full set of changes, profile data,
+and methodology.
+
+---
+
 # DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for
@@ -1190,3 +1245,214 @@ first answer:
   logit/model issues.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.
+
+---
+
+# AMD ROCm / Strix Halo (gfx1151) — port and optimization details
+
+## Hardware target
+
+| Field | Value |
+|---|---|
+| Platform | AMD Strix Halo (Ryzen AI MAX+ 395 w/ Radeon 8060S Graphics) |
+| GPU arch | gfx1151 (RDNA 3.5) |
+| CUs | 40 |
+| Wavefront | 32 lanes |
+| LDS | 64 KB per CU |
+| Max waves/CU | 32 |
+| Toolchain | ROCm 7.2 / HIP 7.2.53211 / clang 22 |
+| Model | DeepSeek V4 Flash, IQ2_XXS (80.76 GiB) |
+
+## Build
+
+```bash
+make rocm ROCM_ARCH=gfx1151
+```
+
+Produces `ds4`, `ds4-server`, `ds4-bench`, `ds4-eval`, and `ds4-agent`.
+
+The `rocm` target switches `NVCC` → `hipcc`, `NVCCFLAGS` →
+`--offload-arch=$(ROCM_ARCH) -D__HIP_PLATFORM_AMD__`, and
+`CUDA_LDLIBS` → `-L$(ROCM_PATH)/lib -lhipblas`. `ds4_cuda.cu` gains a
+`#include "ds4_rocm.h"` under `__HIP_PLATFORM_AMD__` so the existing
+NVIDIA build paths are entirely undisturbed.
+
+## What the HIP shim does (`ds4_rocm.h`)
+
+Macro-renames every cuda* / cublas* / CUBLAS_* / CUDA_R_* / cudaFunc* /
+cudaDevAttr* / cudaMem* / cudaStream* / cudaEvent* symbol to its hipBLAS /
+HIP equivalent. Aliases `namespace nvcuda::wmma = rocwmma;` and
+`namespace cub = hipcub;` so the rest of the file compiles unchanged.
+Provides byte-SIMD helpers (`__vcmpne4`, `__vsub4`) that NVIDIA exposes
+as PTX intrinsics but AMDGCN does not.
+
+`__dp4a` is implemented as `__builtin_amdgcn_sudot4(1, a, 1, b, c, 0)`,
+which compiles to `v_dot4_i32_iu8 ... neg_lo:[1,1,0]` on gfx1151 (a
+single VALU op). The byte-by-byte fallback used ~7 scalar ops per call.
+gfx1151's `dot1-insts` (`v_dot4_i32_i8`) is *not* present; the IU8
+variant with signed/signed flags is the correct path.
+
+## Source patches in `ds4_cuda.cu` (beyond the shim)
+
+| Patch | Why |
+|---|---|
+| `#include "ds4_rocm.h"` under `__HIP_PLATFORM_AMD__`, plus `FULL_WARP_MASK` / `MASK_T` defines | HIP's `__shfl_*_sync` requires a 64-bit mask; CUDA uses 32-bit. The macros let the same source compile cleanly for both. |
+| `0xffffffffu` → `FULL_WARP_MASK` in all 10 `__shfl*_sync` literal-mask call sites | HIP `static_assert(sizeof(MaskT) == 8)` rejects 32-bit literals. |
+| `(MASK_T)mask` cast on 4 variable-mask `__shfl_down_sync` calls | Same reason. |
+| `(const void*)indexer_topk_8192_cub_kernel` at 2 `cudaFuncSetAttribute` call sites | `hipFuncSetAttribute` takes `const void*` strictly. |
+| `CUDA_R_32F` → `CUBLAS_COMPUTE_32F` for the *compute type* arg of 3 `cublasGemmEx` / `cublasGemmStridedBatchedEx` calls | cuBLAS overloads `computeType`; hipBLAS only accepts the new `hipblasComputeType_t` form. |
+| `rsqrtf((float)head_dim)` → `1.0f / sqrtf(...)` at 2 host-context call sites feeding `cublasSgemmStridedBatched` alpha | HIP's `rsqrtf` is `__device__`-only. The other 8 `rsqrtf` calls are inside `__global__` kernels and unchanged. |
+
+These are mechanical; they keep behavior identical on CUDA.
+
+## Performance optimizations
+
+Profile-driven, validated against the older `antirez/ds4@rocm` snapshot
+on the same hardware. The ds4_rocm_report06012026 / 06022026 reports
+contain the full kernel-by-kernel rocprofv3 data.
+
+### Single biggest win: F16 pair matmul rewrite
+
+`matmul_f16_pair_ordered_chunks_kernel` (the qkv pair projection at
+decode, 37.89 % of GPU time in the prior profile) had two compounding
+inefficiencies on RDNA:
+
+* **Strided non-coalesced loads** — each lane took its own contiguous
+  K-chunk, so 32 lanes in a wavefront hit 32 different cache lines per
+  cycle.
+* **Serial reduction in lane 0** — 32 sequential f-adds in one lane
+  while the other 31 idled.
+
+The rewrite has adjacent lanes read adjacent f16 weights (one
+coalesced 64-byte transaction per iter) and reduces with a
+`warp_sum_f32_local` shuffle tree. **4.2× faster** in the prior
+measurement campaign on this kernel alone.
+
+The single-output variant `matmul_f16_ordered_chunks_kernel` was
+*intentionally left* on the strided pattern with a comment explaining
+why: it only fires on the router path at out_dim=256 (256 wavefronts
+on 40 CUs ≈ 6 waves/CU). At that occupancy the strided pattern's
+per-lane independent streams hide memory latency better than the
+coalesced one would.
+
+### `matmul_q8_0_hc_expand_preq_warp8_kernel` — parallel n_hc tail
+
+After the warp_sum, the original ran a serial `n_hc × n_hc`
+accumulation in lane 0 (4 serial global loads + 16 serial MACs for
+DSV4 n_hc=4 while 31 lanes idle). Now lanes 0..n_hc-1 each load one
+`residual_hc` value in parallel; the values are broadcast via
+`__shfl_sync` in uniform control flow; the `dst_hc` loop is distributed
+across active lanes.
+
+### Wide-load consolidation in `load_i8x4_i32_unaligned`
+
+The original built a 32-bit value byte-by-byte. The canonical
+`__builtin_memcpy(&r, p, 4)` idiom lets the compiler emit
+`global_load_b128` (verified via `llvm-objdump`) and collapses 4
+dot-product weight loads into one 128-bit transaction in every q8_0 /
+IQ2_XXS warp8 matmul inner loop.
+
+### `__launch_bounds__` annotations (12 kernels)
+
+```
+__launch_bounds__(256, 1)   -- prefill MoE kernels (LDS-bound at ~39 KB
+                               per block, 1 block/CU is the hard ceiling;
+                               the hint lets the compiler use the full
+                               register budget without trying to fit a
+                               second resident block)
+  moe_gate_up_mid_expert_tile8_row32_kernel
+  moe_gate_up_mid_expert_tile8_rowspan_kernel<>
+  moe_down_expert_tile8_row32_kernel
+  moe_down_expert_tile16_row2048_kernel
+  moe_down_expert_tile16_rowspan_kernel<>
+
+__launch_bounds__(256, 4)   -- decode q8_0/MoE-LUT kernels (register-
+                               bound below max occupancy without the hint;
+                               this targets 4 blocks/CU = 32 waves/CU =
+                               wavefront cap). Surprised-by-result 2.88×
+                               on moe_down_sum6_qwarp32 in prior measurement.
+  matmul_q8_0_preq_warp8_kernel
+  matmul_q8_0_pair_preq_warp8_kernel
+  matmul_q8_0_hc_expand_preq_warp8_kernel
+  matmul_q8_0_preq_batch_warp8_kernel
+  grouped_q8_0_a_preq_warp8_kernel
+  moe_gate_up_mid_decode_lut_qwarp32_kernel
+  moe_down_sum6_qwarp32_kernel
+```
+
+The same `(256, 4)` hint was tried on the three online-attention
+kernels but caused launch failures on the incremental-prefill path
+(`cuda attention indexed online launch failed`) — likely register
+pressure + LDS budget interactions on this specific hardware. Those
+hints were reverted; the attention kernels are left to the compiler.
+
+## Measured performance
+
+### Single-prompt smoke test (no prior context)
+
+| Build | Prefill | Generation |
+|---|---|---|
+| Unoptimized HIP port (commit `a706a10`) | 27.99 t/s | 8.78 t/s |
+| With all optimizations (commit `cb716c9`) | **28.23 t/s** | **12.85 t/s** |
+| Δ | +0.9 % | **+46.4 %** |
+
+### Long-context speed bench (32 frontiers, 2 K → 64 K, 128 gen tokens each)
+
+| ctx | prefill t/s | gen t/s | KV cache bytes |
+|---:|---:|---:|---:|
+| 2 048 | 56.32 | 11.95 | 52 184 460 |
+| 8 192 | 54.37 | 10.01 | 136 750 476 |
+| 16 384 | 53.60 | 9.84 | 249 505 164 |
+| 32 768 | 53.06 | 9.38 | 475 014 540 |
+| 49 152 | 52.22 | 8.96 | 700 523 916 |
+| 65 536 | 51.57 | 8.66 | 926 033 292 |
+
+Prefill is dominated by the IQ2_XXS / Q4_K MoE projection kernels
+(LDS-bound on Strix Halo). Generation is dominated by the decode-time
+matmuls plus attention over the KV cache, which is what scales with
+context length. Run the bench yourself with:
+
+```bash
+./ds4-bench -m gguf/<MODEL>.gguf --prompt-file speed-bench/promessi_sposi.txt \
+            --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128
+```
+
+## Correctness
+
+Every optimization pass was followed by a smoke run on the Redis Streams
+prompt — output was coherent every time, no NaN, no garbled tokens.
+Floating-point reduction order changed in two kernels (F16 pair matmul:
+linear → tree-pairwise; hc_expand tail: lane-0 serial → lane-distributed).
+The differences are ULP-level and absorbed by sampling.
+
+## Levers left on the table
+
+The bench is currently prefill-bound (~58 % of long-context GPU time in
+the prior profile is in two prefill MoE kernels +
+`hipblas_Tensile(HSS)`). Further wins likely need kernel-body rewrites:
+
+1. **Halve the LDS staging** in
+   `moe_gate_up_mid_expert_tile8_rowspan_kernel` from `sxq[8][16]`
+   (~36.5 KB) to `sxq[8][8]` (~18.3 KB), processing activation blocks
+   in two passes. Drops per-block LDS from ~39 KB to ~22 KB, would let
+   2 blocks/CU resident on Strix Halo's 64 KB LDS — potential 2×
+   occupancy on the bench's #1 hotspot. Same idea applies to
+   `moe_down_expert_tile16_row2048_kernel`.
+
+2. **`hipblasLt` autotuner** in place of the current Tensile HSS GEMM
+   selection — 25 % of bench time is in one GEMM family that the
+   default hipBLAS picker chose.
+
+3. **WMMA-based GEMM rewrite** for the dominant MoE projection.
+   `v_wmma_i32_16x16x16_iu8` does 4096 INT8 MACs/instruction with ~32-
+   cycle latency — a potential ~30× throughput vs the current
+   `v_dot4_i32_iu8` path. Requires a 16×16×16 tile-shape restructure of
+   the row/lane assignment in the warp8 kernels.
+
+## Commits
+
+| SHA | What |
+|---|---|
+| `a706a10` | Baseline ROCm/HIP build — HIP shim, Makefile `rocm` target, mechanical CUDA/HIP API delta fixes. |
+| `3db8635` | Profile-driven kernel tuning — F16 pair coalesced rewrite, hc_expand parallel tail, wide-load memcpy, 15 launch_bounds annotations. |
+| `cb716c9` | Revert launch_bounds on the three online attention kernels (caused launch failures at ctx ≥4K on the bench). |
