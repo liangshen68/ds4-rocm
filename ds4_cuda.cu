@@ -1857,6 +1857,13 @@ __global__ static void matmul_f16_serial_kernel(
     out[tok * out_dim + row] = sum;
 }
 
+__device__ __forceinline__ static float warp_sum_f32_local(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(FULL_WARP_MASK, v, offset);
+    }
+    return v;
+}
+
 __global__ static void matmul_f16_ordered_chunks_kernel(
         float *out,
         const __half *w,
@@ -1868,6 +1875,11 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     uint64_t tok = (uint64_t)blockIdx.y;
     if (row >= out_dim || tok >= n_tok) return;
 
+    // Used only by the router path (in_dim=4096, out_dim=256, n_tok=1).
+    // 256 wavefronts on 40 CUs leaves the GPU underoccupied, so the
+    // contiguous-per-thread chunk pattern intentionally lets adjacent
+    // lanes issue independent strided loads — that lane-level ILP hides
+    // memory latency better here than a strictly coalesced pattern would.
     __shared__ float partial[32];
     const uint32_t tid = threadIdx.x;
     float sum = 0.0f;
@@ -1898,37 +1910,31 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         uint64_t in_dim,
         uint64_t out0_dim,
         uint64_t out1_dim) {
-    uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t row = (uint64_t)blockIdx.x;
     if (row >= out0_dim && row >= out1_dim) return;
 
-    __shared__ float partial0[32];
-    __shared__ float partial1[32];
-    const uint32_t tid = threadIdx.x;
+    // 32-thread block: each lane strides the K dimension by 32, so the
+    // wavefront issues coalesced 64-byte loads on each weight matrix and
+    // the activation vector. Reduction is a warp_sum shuffle tree instead
+    // of a serial 32-element sum in lane 0. On gfx1151 this kernel went
+    // from ~765µs to ~183µs (4.2x) on a DeepSeek V4 Flash decode step.
+    const uint32_t lane = threadIdx.x;
+    const bool active0 = row < out0_dim;
+    const bool active1 = row < out1_dim;
+    const __half *wr0 = active0 ? w0 + row * in_dim : w0;
+    const __half *wr1 = active1 ? w1 + row * in_dim : w1;
     float sum0 = 0.0f;
     float sum1 = 0.0f;
-    const uint64_t chunk = (in_dim + 31u) / 32u;
-    const uint64_t k0 = (uint64_t)tid * chunk;
-    uint64_t k1 = k0 + chunk;
-    if (k1 > in_dim) k1 = in_dim;
-    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
-    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
-    for (uint64_t i = k0; i < k1; i++) {
+    for (uint64_t i = lane; i < in_dim; i += 32u) {
         const float xv = x[i];
-        if (row < out0_dim) sum0 += __half2float(wr0[i]) * xv;
-        if (row < out1_dim) sum1 += __half2float(wr1[i]) * xv;
+        if (active0) sum0 += __half2float(wr0[i]) * xv;
+        if (active1) sum1 += __half2float(wr1[i]) * xv;
     }
-    partial0[tid] = sum0;
-    partial1[tid] = sum1;
-    __syncthreads();
-    if (tid == 0) {
-        float total0 = 0.0f;
-        float total1 = 0.0f;
-        for (uint32_t i = 0; i < 32u; i++) {
-            total0 += partial0[i];
-            total1 += partial1[i];
-        }
-        if (row < out0_dim) out0[row] = total0;
-        if (row < out1_dim) out1[row] = total1;
+    sum0 = warp_sum_f32_local(sum0);
+    sum1 = warp_sum_f32_local(sum1);
+    if (lane == 0) {
+        if (active0) out0[row] = sum0;
+        if (active1) out1[row] = sum1;
     }
 }
 
@@ -1995,11 +2001,13 @@ __device__ __forceinline__ static int32_t load_i8x4_i32_aligned(const int8_t *p)
 }
 
 __device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *p) {
-    const uint8_t *u = (const uint8_t *)p;
-    return (int32_t)((uint32_t)u[0] |
-                     ((uint32_t)u[1] << 8) |
-                     ((uint32_t)u[2] << 16) |
-                     ((uint32_t)u[3] << 24));
+    // RDNA3/RDNA3.5 (gfx1100/gfx1151) handles misaligned global_load_b32 in
+    // hardware (extra cost only when crossing a 128B cache line). Use a
+    // memcpy so the compiler emits one 32-bit load rather than four
+    // global_load_u8 + shifts/ORs from the explicit byte-by-byte form.
+    int32_t r;
+    __builtin_memcpy(&r, p, sizeof(r));
+    return r;
 }
 
 __device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
@@ -2132,7 +2140,7 @@ __global__ static void matmul_q8_0_preq_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
-__global__ static void matmul_q8_0_preq_warp8_kernel(
+__global__ __launch_bounds__(256, 4) static void matmul_q8_0_preq_warp8_kernel(
         float *out,
         const unsigned char *w,
         const int8_t *xq,
@@ -2159,7 +2167,7 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
-__global__ static void matmul_q8_0_pair_preq_warp8_kernel(
+__global__ __launch_bounds__(256, 4) static void matmul_q8_0_pair_preq_warp8_kernel(
         float *out0,
         float *out1,
         const unsigned char *w0,
@@ -2204,7 +2212,7 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
-__global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
+__global__ __launch_bounds__(256, 4) static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         float *out_hc,
         float *block_out,
         const float *block_add,
@@ -2235,9 +2243,29 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         acc += __half2float(*scale_h) * xscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0) {
-        const uint32_t d = (uint32_t)row;
-        block_out[d] = acc;
+    const uint32_t d = (uint32_t)row;
+    if (lane == 0) block_out[d] = acc;
+    // Distribute the n_hc x n_hc tail across the warp instead of running it
+    // serially in lane 0. Lanes 0..n_hc-1 each own one dst_hc output and
+    // load one residual_hc value in parallel; the values are shared across
+    // the warp via shuffles in uniform control flow. For DSV4 n_hc=4 this
+    // turns 4 serial residual loads + 16 serial MACs in one lane into
+    // parallel loads + 4 MACs per active lane.
+    if (n_hc <= 32u) {
+        acc = __shfl_sync(FULL_WARP_MASK, acc, 0);
+        float block_v = acc;
+        if (has_add) block_v += block_add[d];
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        const bool active = lane < n_hc;
+        const float my_res = active ? residual_hc[(uint64_t)lane * n_embd + d] : 0.0f;
+        float hc_acc = active ? block_v * post[lane] : 0.0f;
+        for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+            const float res_v = __shfl_sync(FULL_WARP_MASK, my_res, src_hc);
+            if (active) hc_acc += comb[lane + (uint64_t)src_hc * n_hc] * res_v;
+        }
+        if (active) out_hc[(uint64_t)lane * n_embd + d] = hc_acc;
+    } else if (lane == 0) {
         float block_v = acc;
         if (has_add) block_v += block_add[d];
         const float *post = split + n_hc;
@@ -2254,7 +2282,7 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
     }
 }
 
-__global__ static void matmul_q8_0_preq_batch_warp8_kernel(
+__global__ __launch_bounds__(256, 4) static void matmul_q8_0_preq_batch_warp8_kernel(
         float *out,
         const unsigned char *w,
         const int8_t *xq,
@@ -2324,7 +2352,7 @@ __global__ static void dequant_q8_0_to_f32_kernel(
     out[gid] = scale * (float)q;
 }
 
-__global__ static void grouped_q8_0_a_preq_warp8_kernel(
+__global__ __launch_bounds__(256, 4) static void grouped_q8_0_a_preq_warp8_kernel(
         float *low,
         const unsigned char *w,
         const int8_t *xq,
@@ -3568,7 +3596,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
 }
 
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
-__global__ static void attention_indexed_mixed_heads8_online_kernel(
+__global__ __launch_bounds__(256, 4) static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
@@ -3733,7 +3761,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
-__global__ static void attention_static_mixed_heads8_online_kernel(
+__global__ __launch_bounds__(256, 4) static void attention_static_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
@@ -3857,7 +3885,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
-__global__ static void attention_decode_mixed_heads8_online_kernel(
+__global__ __launch_bounds__(256, 4) static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
@@ -8815,7 +8843,7 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
     }
 }
 
-__global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
+__global__ __launch_bounds__(256, 4) static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float *gate_out,
         float *up_out,
         float *mid_out,
@@ -9141,7 +9169,7 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
     }
 }
 
-__global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
+__global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_row32_kernel(
         float *gate_out,
         float *up_out,
         float *mid_out,
@@ -9325,7 +9353,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
 }
 
 template <uint32_t ROW_SPAN>
-__global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
+__global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         float *gate_out,
         float *up_out,
         float *mid_out,
@@ -9733,7 +9761,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel(
     }
 }
 
-__global__ static void moe_down_sum6_qwarp32_kernel(
+__global__ __launch_bounds__(256, 4) static void moe_down_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -10102,7 +10130,7 @@ __global__ static void moe_down_expert_tile4_row32_kernel(
     }
 }
 
-__global__ static void moe_down_expert_tile8_row32_kernel(
+__global__ __launch_bounds__(256, 1) static void moe_down_expert_tile8_row32_kernel(
         float *down_out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -10235,7 +10263,7 @@ __global__ static void moe_down_expert_tile16_row32_kernel(
     }
 }
 
-__global__ static void moe_down_expert_tile16_row2048_kernel(
+__global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_row2048_kernel(
         float *down_out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -10309,7 +10337,7 @@ __global__ static void moe_down_expert_tile16_row2048_kernel(
 }
 
 template <uint32_t ROW_SPAN>
-__global__ static void moe_down_expert_tile16_rowspan_kernel(
+__global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_rowspan_kernel(
         float *down_out,
         const char *down_base,
         const cuda_block_q8_K *midq,
