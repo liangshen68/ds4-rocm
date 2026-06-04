@@ -11,6 +11,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hipblas/hipblas.h>
+#include <hipblaslt/hipblaslt.h>
 #include <rocwmma/rocwmma.hpp>
 #include <hipcub/block/block_radix_sort.hpp>
 

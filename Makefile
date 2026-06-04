@@ -32,7 +32,7 @@ NVCC := $(ROCM_PATH)/bin/hipcc
 NVCCFLAGS ?= -O3 -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ \
              -DDS4_HIP_NO_LDS_STAGING \
              -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-CUDA_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
+CUDA_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -lhipblas -lhipblaslt
 EXTRA_DEPS = ds4_rocm.h
 else
 # NVIDIA / CUDA toolchain (default).
