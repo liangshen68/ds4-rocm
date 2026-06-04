@@ -9654,6 +9654,238 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
     }
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+// WMMA-based prefill MoE gate+up kernel for gfx1151 (RDNA 3.5).
+//
+// One warp (32 threads on wave32) computes a 16-row × 16-pair output tile
+// for a single expert. For each Q8_K-aligned weight block (256 K-elements,
+// = 8 IQ2_XXS sub-blocks of 32 K each):
+//
+//   - Dequantize 16 rows × 32 K of GATE weights to FP16 in LDS, applying
+//     the per-row (0.125 * d_w * ls) scale. Same for UP.
+//   - Dequantize the pair activations to FP16 in LDS, applying the per-pair
+//     d_a scale.
+//   - Two v_wmma_f32_16x16x16_f16 calls per sub-block (K[0..15], K[16..31])
+//     accumulate into FP32 fragments acc_gate / acc_up.
+//
+// After all K-blocks: store the fragments, apply SiLU(gate)*up*weight, and
+// write gate_out/up_out (optional) and mid_out.
+//
+// LDS budget per block:
+//   gate_w / up_w / a:        16 * 32 * 2 bytes (FP16) * 3 = 3 KB
+//   iq2 LUTs (grid+signs):    ~2.2 KB
+//   per-row scales (gate+up): 16 * 4 bytes * 2 = 128 B
+//   per-pair act scale:       16 * 4 bytes = 64 B
+//   c-staging (output flip):  16 * 16 * 4 bytes * 2 = 2 KB
+//   ----
+//   ~7.5 KB per block — comfortably allows 8 blocks/CU at 1 warp/block.
+__global__ __launch_bounds__(32, 16) static void moe_gate_up_mid_expert_wmma_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    namespace wmma = ::rocwmma;
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    const uint32_t lane = threadIdx.x;  // 0..31
+    const uint32_t row_base = blockIdx.x * 16u;
+    if (row_base >= expert_mid_dim) return;
+    const uint32_t rows_active = (row_base + 16u <= expert_mid_dim) ? 16u : (expert_mid_dim - row_base);
+
+    // Resolve pairs (tile8: up to 8 pairs)
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t np = 0;
+    const uint32_t expert_count = counts[expert];
+    const uint32_t expert_offset = offsets[expert];
+    for (; np < 8u; np++) {
+        const uint32_t lp = local_start + np;
+        if (lp >= expert_count) break;
+        pair[np] = sorted_pairs[expert_offset + lp];
+        tok[np] = pair[np] / n_expert;
+        slot[np] = pair[np] - tok[np] * n_expert;
+    }
+    if (np == 0) return;
+
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ __half gate_w_lds[16 * 32];   // 16 rows × 32 K per sub-block iteration
+    __shared__ __half up_w_lds[16 * 32];
+    __shared__ __half a_lds[16 * 32];        // 16 pairs × 32 K, col-major (pair-major)
+
+    // Stage LUTs once.
+    for (uint32_t i = lane; i < 256u; i += 32u) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = lane; i < 128u; i += 32u) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_gate, acc_up;
+    wmma::fill_fragment(acc_gate, 0.0f);
+    wmma::fill_fragment(acc_up, 0.0f);
+
+    // Outer loop: cuda_block_iq2_xxs (one per 256 K-elements).
+    // xq_blocks = in_dim / 256.
+    for (uint32_t cb = 0; cb < xq_blocks; cb++) {
+        // Per-row gate / up scales (d_w), per-pair activation scale (d_a).
+        // We compute these lazily per sub-block.
+        const cuda_block_iq2_xxs *gr_base =
+            (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes);
+        const cuda_block_iq2_xxs *ur_base =
+            (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes);
+        // 8 IQ2 sub-blocks per cuda_block_iq2_xxs.
+        #pragma unroll 1
+        for (uint32_t sb = 0; sb < 8u; sb++) {
+            // ---- Dequantize 16 rows × 32 K of GATE and UP weights to FP16 in LDS ----
+            // For lane in 0..31: handle one (row, k) where row = lane/2, k starts based on lane%2.
+            // Actually: 16 rows × 32 K = 512 elements; with 32 lanes, each lane handles 16 elements.
+            // We do it as: each lane handles one row's "byte-quartet" (4 K-elements) of weights —
+            // 16 rows × 8 quartets = 128 quartets; with 32 lanes that's 4 quartets/lane.
+            // Simpler: each pair of lanes (l, l+16) handles row l, with each lane doing half the
+            // K elements. Avoid getting fancy — just do scalar loops in 32 lanes covering 16 rows × 32 K.
+            // Layout: 16*32 = 512 / 32 = 16 elements per lane. We map: e in 0..15 → idx=lane*16+e,
+            // row = idx/32, k = idx%32.
+            #pragma unroll
+            for (uint32_t e = 0; e < 16u; e++) {
+                const uint32_t idx = lane * 16u + e;
+                const uint32_t r = idx / 32u;
+                const uint32_t k = idx % 32u;
+                __half gv = (__half)0, uv = (__half)0;
+                if (r < rows_active) {
+                    // Address: cuda_block_iq2_xxs at gate_base + expert*gate_expert_bytes + row*gate_row_bytes + cb*sizeof(iq2_xxs)
+                    const cuda_block_iq2_xxs *gr_p =
+                        (const cuda_block_iq2_xxs *)((const char *)gr_base + (uint64_t)(row_base + r) * gate_row_bytes) + cb;
+                    const cuda_block_iq2_xxs *ur_p =
+                        (const cuda_block_iq2_xxs *)((const char *)ur_base + (uint64_t)(row_base + r) * gate_row_bytes) + cb;
+                    // Decode this sub-block (sb in 0..7): 4 q2 values starting at qs[sb*4].
+                    const uint16_t *gq2 = gr_p->qs + sb * 4u;
+                    const uint16_t *uq2 = ur_p->qs + sb * 4u;
+                    const uint32_t g_aux0 = (uint32_t)gq2[0] | ((uint32_t)gq2[1] << 16);
+                    const uint32_t g_aux1 = (uint32_t)gq2[2] | ((uint32_t)gq2[3] << 16);
+                    const uint32_t u_aux0 = (uint32_t)uq2[0] | ((uint32_t)uq2[1] << 16);
+                    const uint32_t u_aux1 = (uint32_t)uq2[2] | ((uint32_t)uq2[3] << 16);
+                    const int32_t g_ls = (int32_t)(2u * (g_aux1 >> 28) + 1u);
+                    const int32_t u_ls = (int32_t)(2u * (u_aux1 >> 28) + 1u);
+                    const float g_d = dev_f16_to_f32(gr_p->d);
+                    const float u_d = dev_f16_to_f32(ur_p->d);
+                    // For position k in 0..31: which of the 4 LUT-pairs (0..3) it belongs to,
+                    // and which of the 8 bytes within that pair (0..7).
+                    const uint32_t pair_idx = k >> 3;     // 0..3 → which (grid_idx, sign_idx) pair
+                    const uint32_t byte_off = k & 7u;     // 0..7 within the 8 bytes of grid[gi]
+                    auto decode = [&](uint32_t aux0, uint32_t aux1, uint8_t &gi, uint32_t &si) {
+                        gi = (uint8_t)((aux0 >> (pair_idx * 8u)) & 0xffu);
+                        si = (aux1 >> (pair_idx * 7u)) & 127u;
+                    };
+                    uint8_t g_gi, u_gi;
+                    uint32_t g_si, u_si;
+                    decode(g_aux0, g_aux1, g_gi, g_si);
+                    decode(u_aux0, u_aux1, u_gi, u_si);
+                    // Decode grid → 8 INT8 bytes; pick byte_off.
+                    const uint64_t g_grid = s_iq2_grid[g_gi];
+                    const uint64_t u_grid = s_iq2_grid[u_gi];
+                    const uint32_t g_signs = dev_unpack_iq2_signs(s_iq2_signs[g_si]);
+                    const uint32_t u_signs = dev_unpack_iq2_signs(s_iq2_signs[u_si]);
+                    // Byte b of grid (b=0..7): byte value = ((grid >> (b*8)) & 0xff)
+                    // Sign for byte b: if signs has bit b set (using the masks 0x01,0x02,0x04,...,0x80), negate.
+                    const int8_t g_byte = (int8_t)((g_grid >> (byte_off * 8u)) & 0xffu);
+                    const int8_t u_byte = (int8_t)((u_grid >> (byte_off * 8u)) & 0xffu);
+                    const uint32_t g_sign_bit = (g_signs >> (byte_off * 4u)) & 1u;
+                    const uint32_t u_sign_bit = (u_signs >> (byte_off * 4u)) & 1u;
+                    const int32_t g_val = g_sign_bit ? -(int32_t)g_byte : (int32_t)g_byte;
+                    const int32_t u_val = u_sign_bit ? -(int32_t)u_byte : (int32_t)u_byte;
+                    // Apply (0.125 * d_w * ls) as a single FP16 scale.
+                    const float g_scale = 0.125f * g_d * (float)g_ls;
+                    const float u_scale = 0.125f * u_d * (float)u_ls;
+                    gv = __float2half(g_scale * (float)g_val);
+                    uv = __float2half(u_scale * (float)u_val);
+                }
+                gate_w_lds[idx] = gv;
+                up_w_lds[idx] = uv;
+            }
+
+            // ---- Dequantize 16 pair activations × 32 K to FP16 ----
+            // Activation address: xq + tok[p] * xq_blocks + cb (one cuda_block_q8_K per K-block).
+            // Layout in a_lds: col-major (pair-major), idx = p*32 + k.
+            #pragma unroll
+            for (uint32_t e = 0; e < 16u; e++) {
+                const uint32_t idx = lane * 16u + e;
+                const uint32_t p = idx / 32u;
+                const uint32_t k = idx % 32u;
+                __half v = (__half)0;
+                if (p < np) {
+                    const cuda_block_q8_K *xqb = xq + (uint64_t)tok[p] * xq_blocks + cb;
+                    const float d_a = xqb->d;
+                    const int8_t q = xqb->qs[sb * 32u + k];
+                    v = __float2half(d_a * (float)q);
+                }
+                a_lds[idx] = v;
+            }
+
+            // ---- Two WMMA calls (K[0..15], K[16..31]) ----
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> ga0, ga1, ua0, ua1;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b0, b1;
+            wmma::load_matrix_sync(ga0, &gate_w_lds[0],  32);
+            wmma::load_matrix_sync(ga1, &gate_w_lds[16], 32);
+            wmma::load_matrix_sync(ua0, &up_w_lds[0],    32);
+            wmma::load_matrix_sync(ua1, &up_w_lds[16],   32);
+            wmma::load_matrix_sync(b0,  &a_lds[0],       32);
+            wmma::load_matrix_sync(b1,  &a_lds[16],      32);
+            wmma::mma_sync(acc_gate, ga0, b0, acc_gate);
+            wmma::mma_sync(acc_gate, ga1, b1, acc_gate);
+            wmma::mma_sync(acc_up,   ua0, b0, acc_up);
+            wmma::mma_sync(acc_up,   ua1, b1, acc_up);
+        }
+    }
+
+    // ---- Apply clamp / SiLU(gate) * up * routing_weight; write outputs ----
+    // Store fragments to LDS col-major (pair-major), then scatter.
+    __shared__ float c_gate_lds[16 * 16];
+    __shared__ float c_up_lds[16 * 16];
+    wmma::store_matrix_sync(c_gate_lds, acc_gate, 16, wmma::mem_col_major);
+    wmma::store_matrix_sync(c_up_lds,   acc_up,   16, wmma::mem_col_major);
+
+    // Compute mid_out and optionally gate_out/up_out for active (p, r) pairs.
+    // 16 pairs × 16 rows = 256 elements; 32 lanes × 8 = 256.
+    #pragma unroll
+    for (uint32_t e = 0; e < 8u; e++) {
+        const uint32_t idx = lane * 8u + e;
+        const uint32_t p = idx / 16u;
+        const uint32_t r = idx % 16u;
+        if (p < np && r < rows_active) {
+            float g = c_gate_lds[p * 16u + r];
+            float u = c_up_lds[p * 16u + r];
+            if (clamp > 1.0e-6f) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + (row_base + r);
+            if (write_aux) {
+                gate_out[off] = g;
+                up_out[off] = u;
+            }
+            mid_out[off] = (g / (1.0f + expf(-g))) * u * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+        }
+    }
+}
+#endif
+
 template <uint32_t ROW_SPAN>
 #ifdef DS4_HIP_NO_LDS_STAGING
 __global__ __launch_bounds__(256, 4) static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
@@ -11197,6 +11429,24 @@ static int routed_moe_launch(
                             write_gate_up, clamp);
                     }
                 } else if (use_gate_row2048) {
+#ifdef __HIP_PLATFORM_AMD__
+                    // gfx1151 WMMA path: 16-row × 16-pair tiles via
+                    // v_wmma_f32_16x16x16_f16. Numerically correct but
+                    // currently SLOWER than the scalar rowspan kernel
+                    // (single-warp-per-block design has too much
+                    // per-block dequant overhead — needs multi-warp
+                    // rewrite to amortize). Off by default; enable via
+                    // DS4_HIP_USE_WMMA_MOE=1 for experimentation.
+                    if (getenv("DS4_HIP_USE_WMMA_MOE") != NULL) {
+                        dim3 tgrid((expert_mid_dim + 15u) / 16u, tile_capacity, 1);
+                        moe_gate_up_mid_expert_wmma_kernel<<<tgrid, 32>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            write_gate_up, clamp);
+                    } else
+#endif
                     if (gate_row_span == 512u) {
                         dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
                         moe_gate_up_mid_expert_tile8_rowspan_kernel<512><<<tgrid, 256>>>(
