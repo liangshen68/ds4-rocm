@@ -3602,7 +3602,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
 }
 
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
-__global__ static void attention_indexed_mixed_heads8_online_kernel(
+__global__ __launch_bounds__(512, 2) static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
@@ -9175,7 +9175,11 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
     }
 }
 
+#ifdef DS4_HIP_NO_LDS_STAGING
+__global__ __launch_bounds__(256, 4) static void moe_gate_up_mid_expert_tile8_row32_kernel(
+#else
 __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_row32_kernel(
+#endif
         float *gate_out,
         float *up_out,
         float *mid_out,
@@ -9202,7 +9206,9 @@ __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_ro
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
+#ifndef DS4_HIP_NO_LDS_STAGING
     __shared__ cuda_block_q8_K sxq[8][16];
+#endif
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -9219,15 +9225,19 @@ __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_ro
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
     if (xq_blocks <= 16u) {
+#ifndef DS4_HIP_NO_LDS_STAGING
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
+#endif
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
+#ifndef DS4_HIP_NO_LDS_STAGING
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+#endif
     }
     if (row >= expert_mid_dim) return;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -10146,7 +10156,11 @@ __global__ static void moe_down_expert_tile4_row32_kernel(
     }
 }
 
+#ifdef DS4_HIP_NO_LDS_STAGING
+__global__ __launch_bounds__(256, 4) static void moe_down_expert_tile8_row32_kernel(
+#else
 __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile8_row32_kernel(
+#endif
         float *down_out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -10168,7 +10182,9 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile8_row32_ker
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
+#ifndef DS4_HIP_NO_LDS_STAGING
     __shared__ cuda_block_q8_K sxq[8][8];
+#endif
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
     uint32_t np = 0;
@@ -10178,6 +10194,7 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile8_row32_ker
         pair[np] = sorted_pairs[offsets[expert] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
+#ifndef DS4_HIP_NO_LDS_STAGING
     if (midq_blocks <= 8u) {
         for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
             uint32_t p = i / midq_blocks;
@@ -10187,6 +10204,7 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile8_row32_ker
         __syncthreads();
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
+#endif
     if (row >= out_dim) return;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
