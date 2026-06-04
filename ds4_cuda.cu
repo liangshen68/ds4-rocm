@@ -2229,6 +2229,129 @@ __global__ static void quantize_q8_0_f32_kernel(
     }
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+// WMMA-based Q8_0 prefill GEMM for gfx1151 (RDNA 3.5).
+//
+// Each block (one warp = 32 threads on wave32) computes a 16-row x 16-token
+// output tile. For each Q8_0 K-block (32 K-elements), we dequantize the 16
+// weight rows × 32 K to FP16 in LDS (multiplying each int8 weight by the
+// row's FP16 block scale), similarly dequantize 32 K × 16 tokens of
+// activations to FP16 in LDS (multiplying by the token's FP32 block scale
+// downcast to FP16), then do two v_wmma_f32_16x16x16_f16 calls (K[0..15]
+// and K[16..31]) accumulating into a single FP32 fragment. After the K
+// loop we store the FP32 fragment to the output.
+//
+// Saves ~85x kernel-compute over the scalar dp4a path because v_wmma does
+// 4096 FP16 MACs per instruction with 1/cycle throughput on gfx1151.
+__global__ __launch_bounds__(32, 16) static void matmul_q8_0_preq_wmma_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    namespace wmma = ::rocwmma;
+    const uint32_t row_base = blockIdx.x * 16u;
+    const uint32_t tok_base = blockIdx.y * 16u;
+    if (row_base >= out_dim || tok_base >= n_tok) return;
+    const uint32_t lane = threadIdx.x;  // 0..31
+
+    // LDS staging (per warp): 16x32 FP16 weights + 32x16 FP16 activations.
+    // 2 KB + 1 KB = 3 KB / block; trivial vs 64 KB LDS budget so 16
+    // blocks/CU is achievable for occupancy.
+    __shared__ __half w_lds[16 * 32];  // row-major: w_lds[r * 32 + k]
+    __shared__ __half a_lds[32 * 16];  // col-major: a_lds[t * 32 + k]
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+
+    // How many rows/tokens are valid in the trailing tile (boundary handling).
+    const uint32_t rows_active = (row_base + 16u <= out_dim) ? 16u : (uint32_t)(out_dim - row_base);
+    const uint32_t toks_active = (tok_base + 16u <= n_tok) ? 16u : (uint32_t)(n_tok - tok_base);
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        // ---- Dequantize 16 rows × 32 K-elements of weights into w_lds ----
+        // Each Q8_0 block is 34 bytes: [fp16 scale][32 int8 qs].
+        // Per row, base pointer:
+        //   wrow = w + (row_base + r) * blocks * 34
+        //   block start = wrow + b * 34
+        // Each thread (lane 0..31) handles one full row's worth of weights
+        // per K-iteration? Actually we have 16 rows × 32 K = 512 elements
+        // for 32 threads, so each thread does 16 elements.
+        #pragma unroll
+        for (uint32_t e = 0; e < 16u; e++) {
+            const uint32_t idx = lane * 16u + e;        // 0..511 covering [16r][32k]
+            const uint32_t r = idx / 32u;               // 0..15
+            const uint32_t k = idx % 32u;               // 0..31
+            __half v = (__half)0;
+            if (r < rows_active) {
+                const uint8_t *wrow = w + ((uint64_t)(row_base + r) * blocks + b) * 34u;
+                const __half scale = *(const __half *)wrow;
+                const int8_t q = *(const int8_t *)(wrow + 2 + k);
+                v = __hmul(scale, __float2half((float)q));
+            }
+            w_lds[idx] = v;
+        }
+
+        // ---- Dequantize 16 tokens × 32 K-elements of activations into a_lds ----
+        // xq is int8 row-major: xq[tok * blocks * 32 + b * 32 + k]
+        // xscale is float: xscale[tok * blocks + b]
+        // a_lds layout: per-token contiguous K — a_lds[t * 32 + k] (col-major B
+        // means each B column is contiguous, "leading dim" = K stride = 32).
+        #pragma unroll
+        for (uint32_t e = 0; e < 16u; e++) {
+            const uint32_t idx = lane * 16u + e;        // 0..511 covering [16t][32k]
+            const uint32_t t = idx / 32u;               // 0..15
+            const uint32_t k = idx % 32u;               // 0..31
+            __half v = (__half)0;
+            if (t < toks_active) {
+                const float sc = xscale[(uint64_t)(tok_base + t) * blocks + b];
+                const int8_t q = xq[((uint64_t)(tok_base + t) * blocks + b) * 32u + k];
+                v = __float2half(sc * (float)q);
+            }
+            a_lds[idx] = v;
+        }
+        // No __syncthreads — one wave per block, so all "threads" are the same warp.
+
+        // ---- Two WMMA calls for K[0..15] and K[16..31] ----
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> af0, af1;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> bf0, bf1;
+        wmma::load_matrix_sync(af0, &w_lds[0],      32);  // K=0..15, leading dim=32
+        wmma::load_matrix_sync(af1, &w_lds[16],     32);  // K=16..31
+        wmma::load_matrix_sync(bf0, &a_lds[0],      32);  // K=0..15 (B col-major, ld=K stride)
+        wmma::load_matrix_sync(bf1, &a_lds[16],     32);  // K=16..31
+        wmma::mma_sync(acc, af0, bf0, acc);
+        wmma::mma_sync(acc, af1, bf1, acc);
+    }
+
+    // ---- Store the 16×16 output tile to global ----
+    // Output is [n_tok][out_dim] in row-major (out[t * out_dim + r]).
+    // Our acc is M=16 rows × N=16 tokens; we want each output row r to go to
+    // [tok][row_base + r]. In our layout, "rows" of acc are weight rows and
+    // "cols" are tokens. The output's natural arrangement is each token's row
+    // being contiguous in r — that's a 16-token × 16-row block in the
+    // [tok][r] layout, where each token has stride out_dim between rows.
+    //
+    // Use a staging LDS to flip layout: store the fragment in col-major
+    // (token-major), then scatter to global.
+    __shared__ float c_lds[16 * 16];  // [token * 16 + row]
+    wmma::store_matrix_sync(c_lds, acc, 16, wmma::mem_col_major);
+
+    // Scatter c_lds[t*16+r] -> out[(tok_base+t)*out_dim + (row_base+r)] for active.
+    #pragma unroll
+    for (uint32_t e = 0; e < 8u; e++) {
+        const uint32_t idx = lane * 8u + e;             // 0..255
+        const uint32_t t = idx / 16u;                   // 0..15
+        const uint32_t r = idx % 16u;                   // 0..15
+        if (t < toks_active && r < rows_active) {
+            out[(uint64_t)(tok_base + t) * out_dim + (row_base + r)] = c_lds[t * 16u + r];
+        }
+    }
+}
+#endif
+
 __global__ __launch_bounds__(256, 4) static void matmul_q8_0_preq_kernel(
         float *out,
         const unsigned char *w,
@@ -6367,6 +6490,23 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
     }
+#ifdef __HIP_PLATFORM_AMD__
+    // gfx1151 WMMA-based path: 16-row × 16-token tiles via
+    // v_wmma_f32_16x16x16_f16. Gated on env var DS4_HIP_USE_WMMA_Q8 and
+    // shape (rows/tokens both multiples of 16 for full-tile efficiency).
+    if (out_dim >= 16 && n_tok >= 16 &&
+        getenv("DS4_HIP_NO_WMMA_Q8") == NULL) {
+        dim3 wgrid(((unsigned)out_dim + 15u) / 16u,
+                   ((unsigned)n_tok + 15u) / 16u, 1);
+        matmul_q8_0_preq_wmma_kernel<<<wgrid, 32>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                xscale,
+                in_dim, out_dim, n_tok, blocks);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 wmma launch");
+    }
+#endif
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_q8_0_preq_kernel<<<grid, 256>>>((float *)out->ptr,
                                            reinterpret_cast<const unsigned char *>(wptr),
