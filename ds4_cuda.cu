@@ -2104,7 +2104,7 @@ __global__ static void quantize_q8_0_f32_kernel(
     }
 }
 
-__global__ static void matmul_q8_0_preq_kernel(
+__global__ __launch_bounds__(256, 4) static void matmul_q8_0_preq_kernel(
         float *out,
         const unsigned char *w,
         const int8_t *xq,
@@ -2130,14 +2130,20 @@ __global__ static void matmul_q8_0_preq_kernel(
         int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
         acc += __half2float(*scale_h) * xsr[b] * (float)dot;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = acc;
+    // Two-level reduction: warp shuffle within each wavefront first,
+    // then one warp does the final cross-warp reduction. Replaces the
+    // log2(256)=8-step shared-memory tree (each step has __syncthreads).
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    acc = warp_sum_f32_local(acc);
+    __shared__ float wsum[8];
+    if (lane == 0) wsum[warp] = acc;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
+    if (warp == 0) {
+        float v = lane < 8u ? wsum[lane] : 0.0f;
+        v = warp_sum_f32_local(v);
+        if (lane == 0) out[tok * out_dim + row] = v;
     }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
 __global__ __launch_bounds__(256, 4) static void matmul_q8_0_preq_warp8_kernel(
@@ -9353,7 +9359,11 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
 }
 
 template <uint32_t ROW_SPAN>
+#ifdef DS4_HIP_NO_LDS_STAGING
+__global__ __launch_bounds__(256, 4) static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
+#else
 __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
+#endif
         float *gate_out,
         float *up_out,
         float *mid_out,
@@ -9380,7 +9390,9 @@ __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_ro
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
+#ifndef DS4_HIP_NO_LDS_STAGING
     __shared__ cuda_block_q8_K sxq[8][16];
+#endif
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -9397,15 +9409,19 @@ __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_ro
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
     if (xq_blocks <= 16u) {
+#ifndef DS4_HIP_NO_LDS_STAGING
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
+#endif
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
+#ifndef DS4_HIP_NO_LDS_STAGING
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+#endif
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
@@ -10263,7 +10279,11 @@ __global__ static void moe_down_expert_tile16_row32_kernel(
     }
 }
 
+#ifdef DS4_HIP_NO_LDS_STAGING
+__global__ __launch_bounds__(256, 4) static void moe_down_expert_tile16_row2048_kernel(
+#else
 __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_row2048_kernel(
+#endif
         float *down_out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -10286,7 +10306,9 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_row2048_
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
+#ifndef DS4_HIP_NO_LDS_STAGING
     __shared__ cuda_block_q8_K sxq[16][8];
+#endif
     uint32_t pair[16] = {0};
     const cuda_block_q8_K *xqb[16] = {NULL};
     uint32_t np = 0;
@@ -10296,6 +10318,7 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_row2048_
         pair[np] = sorted_pairs[offsets[expert] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
+#ifndef DS4_HIP_NO_LDS_STAGING
     if (midq_blocks <= 8u) {
         for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
             uint32_t p = i / midq_blocks;
@@ -10305,6 +10328,7 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_row2048_
         __syncthreads();
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
+#endif
     for (uint32_t rr = 0; rr < 64u; rr++) {
         uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
         if (row >= out_dim) continue;
@@ -10337,7 +10361,11 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_row2048_
 }
 
 template <uint32_t ROW_SPAN>
+#ifdef DS4_HIP_NO_LDS_STAGING
+__global__ __launch_bounds__(256, 4) static void moe_down_expert_tile16_rowspan_kernel(
+#else
 __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_rowspan_kernel(
+#endif
         float *down_out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -10360,7 +10388,9 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_rowspan_
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
+#ifndef DS4_HIP_NO_LDS_STAGING
     __shared__ cuda_block_q8_K sxq[16][8];
+#endif
     uint32_t pair[16] = {0};
     const cuda_block_q8_K *xqb[16] = {NULL};
     uint32_t np = 0;
@@ -10370,6 +10400,7 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_rowspan_
         pair[np] = sorted_pairs[offsets[expert] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
+#ifndef DS4_HIP_NO_LDS_STAGING
     if (midq_blocks <= 8u) {
         for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
             uint32_t p = i / midq_blocks;
@@ -10379,6 +10410,7 @@ __global__ __launch_bounds__(256, 1) static void moe_down_expert_tile16_rowspan_
         __syncthreads();
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
+#endif
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
         if (row >= out_dim) continue;

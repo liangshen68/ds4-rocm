@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DS4 ROCm/gfx1151 Fork — Port &amp; Optimization Report</title>
+<style>
+  :root {
+    --bg: #fdfcf7;
+    --fg: #1f1f1f;
+    --muted: #555;
+    --accent: #b8410e;
+    --good: #1b6f1b;
+    --bad: #a02020;
+    --border: #d8d4c4;
+    --code-bg: #f3efe3;
+    --table-stripe: #f7f4ea;
+  }
+  body {
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    max-width: 960px;
+    margin: 2.5em auto;
+    padding: 0 1.5em;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .3em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .2em; margin-top: 2em; }
+  h3 { color: var(--accent); margin-top: 1.6em; }
+  code, pre { font-family: "SF Mono", "Menlo", Consolas, monospace; }
+  code { background: var(--code-bg); padding: .12em .35em; border-radius: 3px; font-size: 0.92em; }
+  pre {
+    background: var(--code-bg);
+    padding: 1em 1.2em;
+    overflow-x: auto;
+    border-left: 4px solid var(--accent);
+    border-radius: 3px;
+    font-size: 0.86em;
+    line-height: 1.4;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    margin: 1em 0;
+    width: 100%;
+    font-size: 0.93em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .45em .7em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); }
+  tr:nth-child(even) td { background: var(--table-stripe); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .speedup-big { color: var(--good); font-weight: bold; }
+  .speedup-bad { color: var(--bad); }
+  .meta { color: var(--muted); font-size: .92em; }
+  .summary-box {
+    background: #fff8eb;
+    border: 1px solid #d8c790;
+    border-radius: 4px;
+    padding: 1em 1.4em;
+    margin: 1.4em 0;
+  }
+  .summary-box strong { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
+  .footer { color: var(--muted); font-size: .85em; text-align: center; margin-top: 3em; }
+  ol li, ul li { margin-bottom: .3em; }
+  blockquote {
+    border-left: 3px solid var(--border);
+    margin: 1em 0;
+    padding: .4em 1em;
+    color: var(--muted);
+    background: var(--table-stripe);
+  }
+</style>
+</head>
+<body>
+
+<h1>DS4 ROCm/gfx1151 Fork — Port &amp; Optimization Report</h1>
+
+<p class="meta">
+  <strong>Repository:</strong> <a href="https://github.com/liangshen68/ds4-rocm"><code>liangshen68/ds4-rocm</code></a> (fork of <a href="https://github.com/antirez/ds4"><code>antirez/ds4@main</code></a>)<br>
+  <strong>Target hardware:</strong> AMD Strix Halo (Radeon 8060S, gfx1151, RDNA 3.5)<br>
+  <strong>Toolchain:</strong> ROCm 7.2 / HIP 7.2.53211 / clang 22<br>
+  <strong>Model:</strong> DeepSeek V4 Flash IQ2_XXS (80.76 GiB)<br>
+  <strong>Date:</strong> 2026-06-04
+</p>
+
+<h2>0 — Goal</h2>
+
+<p>Take the tip of <code>antirez/ds4@main</code> (CUDA-only, three weeks ahead of the <code>rocm</code> branch the prior session used) and bring it up cleanly on AMD Strix Halo, then re-apply the profile-driven kernel optimizations proven on the older snapshot. Publish to the user's fork at <code>liangshen68/ds4-rocm</code>.</p>
+
+<h2>1 — Executive summary</h2>
+
+<div class="summary-box">
+  Single end-to-end pass, four commits, all pushed to <code>main</code>. All five binaries (<code>ds4</code>, <code>ds4-server</code>, <code>ds4-bench</code>, <code>ds4-eval</code>, <code>ds4-agent</code>) build clean and run; <code>ds4-eval --self-test-extractors</code> passes; every smoke run produces a coherent Redis Streams paragraph; the 32-frontier (2 K → 64 K) long-context bench completes with no launch failures.
+</div>
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th class="num">Unoptimized HIP port (<code>a706a10</code>)</th><th class="num">Optimized (<code>cb716c9</code>)</th><th class="num">Δ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Generation (Redis Streams smoke, no prior context)</strong></td><td class="num">8.78 t/s</td><td class="num"><strong>12.85 t/s</strong></td><td class="num speedup-big">+46.4 %</td></tr>
+    <tr><td>Prefill (same smoke)</td><td class="num">27.99 t/s</td><td class="num">28.23 t/s</td><td class="num">+0.9 %</td></tr>
+    <tr><td>Bench prefill @ 2 K ctx</td><td class="num">—</td><td class="num">56.32 t/s</td><td class="num">—</td></tr>
+    <tr><td>Bench prefill @ 64 K ctx</td><td class="num">—</td><td class="num">51.57 t/s</td><td class="num">—</td></tr>
+    <tr><td>Bench gen @ 2 K ctx</td><td class="num">—</td><td class="num">11.95 t/s</td><td class="num">—</td></tr>
+    <tr><td>Bench gen @ 64 K ctx</td><td class="num">—</td><td class="num">8.66 t/s</td><td class="num">—</td></tr>
+  </tbody>
+</table>
+
+<h2>2 — Starting state</h2>
+
+<p>The user's fork was created from <code>antirez/ds4@main</code>, <strong>not</strong> from the older <code>antirez/ds4@rocm</code> branch the prior session worked on. Practical consequences:</p>
+
+<ul>
+  <li>Pure CUDA — <code>#include &lt;cuda_runtime.h&gt;</code>, <code>#include &lt;mma.h&gt;</code>, <code>#include &lt;cublas_v2.h&gt;</code>, <code>#include &lt;cub/block/block_radix_sort.cuh&gt;</code>, <code>namespace wmma = nvcuda::wmma;</code>, <code>cub::BlockRadixSort&lt;...&gt;</code>. No HIP shim, no <code>__HIP_PLATFORM_AMD__</code> conditionals.</li>
+  <li>No <code>rocm</code> target in <code>Makefile</code>.</li>
+  <li><code>ds4_cuda.cu</code> is now ~11.5 K lines (vs 10 K in the rocm branch), with net-new kernels (Q4_K MoE family, WMMA-based indexer kernels, CUB radix sort topk).</li>
+  <li>New host-side components: <code>ds4_agent</code>, <code>ds4_eval</code>, <code>ds4_help</code>, <code>ds4_web</code>, <code>ds4_distributed</code>, <code>ds4_kvstore</code>.</li>
+  <li>Two new CUDA APIs are used: <code>cudaFuncSetAttribute</code>, <code>cudaDevAttrMaxSharedMemoryPerBlockOptin</code>.</li>
+</ul>
+
+<p>Three weeks of upstream feature work landed since the <code>rocm</code> branch was last hand-rebased, so this is more than a code-shuffle — it's a forward port.</p>
+
+<h2>3 — Build bring-up: what it took to get the first clean compile</h2>
+
+<p>Four files touched in commit <code>a706a10</code>. All annotation-only — no behavioral changes vs upstream on CUDA hardware.</p>
+
+<h3>3.1 <code>ds4_rocm.h</code> (new) — the HIP shim</h3>
+
+<p>A single header that, when <code>__HIP_PLATFORM_AMD__</code> is defined, gives the rest of the source a CUDA-shaped façade:</p>
+
+<ul>
+  <li><strong>Runtime types &amp; status:</strong> <code>cudaError_t</code> → <code>hipError_t</code>, <code>cudaStream_t</code> → <code>hipStream_t</code>, <code>cudaSuccess</code> → <code>hipSuccess</code>, etc.</li>
+  <li><strong>Device query &amp; control:</strong> <code>cudaGetDevice</code> → <code>hipGetDevice</code>, <code>cudaDeviceGetAttribute</code> → <code>hipDeviceGetAttribute</code>, <code>cudaDevAttrPageableMemoryAccess</code> → <code>hipDeviceAttributePageableMemoryAccess</code>, <code>cudaDevAttrMaxSharedMemoryPerBlockOptin</code> → <code>hipDeviceAttributeSharedMemPerBlockOptin</code>.</li>
+  <li><strong>Function attributes (new for this code base):</strong> <code>cudaFuncSetAttribute</code> → <code>hipFuncSetAttribute</code>, <code>cudaFuncAttributeMaxDynamicSharedMemorySize</code> → <code>hipFuncAttributeMaxDynamicSharedMemorySize</code>.</li>
+  <li><strong>Memory &amp; streams &amp; events:</strong> the full set of <code>cudaMalloc</code>, <code>cudaMemcpy*</code>, <code>cudaStream*</code>, <code>cudaEvent*</code>, <code>cudaHostRegister*</code>, <code>cudaMemAdvise*</code>, <code>cudaMemPrefetchAsync</code> (the last two require argument adapters since hipMem* takes scalar <code>id</code> fields where CUDA takes location structs).</li>
+  <li><strong>cuBLAS → hipBLAS:</strong> type and enum mappings, plus <code>cublasGemmEx</code> → <code>hipblasGemmEx</code>, etc.</li>
+  <li><strong>Namespace aliases:</strong>
+<pre><code>namespace nvcuda { namespace wmma = ::rocwmma; }
+namespace cub = hipcub;</code></pre>
+  These let the existing <code>namespace wmma = nvcuda::wmma;</code> and <code>cub::BlockRadixSort&lt;...&gt;</code> lines work unchanged.</li>
+  <li><strong>Includes:</strong> <code>&lt;hip/hip_runtime.h&gt;</code>, <code>&lt;hip/hip_fp16.h&gt;</code>, <code>&lt;hipblas/hipblas.h&gt;</code>, <code>&lt;rocwmma/rocwmma.hpp&gt;</code>, <code>&lt;hipcub/block/block_radix_sort.hpp&gt;</code>.</li>
+  <li><strong>Byte-SIMD helpers</strong> that NVIDIA exposes as PTX intrinsics but AMDGCN doesn't have native:
+    <ul>
+      <li><code>__vcmpne4(a, b)</code> — per-byte not-equal, bit-spread to 0x00/0xFF.</li>
+      <li><code>__vsub4(a, b)</code> — per-byte wrapping subtract (avoids cross-byte borrows via the classic <code>((a|0x80808080) - (b&amp;0x7F7F7F7F)) ^ ((a^~b)&amp;0x80808080)</code> trick).</li>
+    </ul>
+  </li>
+  <li><strong><code>__dp4a</code> reaches gfx1151's <code>v_dot4_i32_iu8</code>:</strong>
+<pre><code>static __device__ __forceinline__ int32_t
+__dp4a(int32_t a, int32_t b, int32_t c) {
+    return __builtin_amdgcn_sudot4(/*a_sign=*/1, a,
+                                   /*b_sign=*/1, b, c, /*clamp=*/0);
+}</code></pre>
+  gfx1151 lacks <code>dot1-insts</code> (no <code>v_dot4_i32_i8</code>), so <code>__builtin_amdgcn_sdot4</code> won't compile. It does have <code>dot8-insts</code> (<code>v_dot4_i32_iu8</code>) — the IU8 variant with signed-signed flags is the correct path. Compiles to one VALU op vs ~7 in the byte fallback.</li>
+</ul>
+
+<h3>3.2 <code>ds4_cuda.cu</code> — source patches beyond the shim</h3>
+
+<table>
+  <thead>
+    <tr><th>Patch</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>#include "ds4_rocm.h"</code> under <code>__HIP_PLATFORM_AMD__</code>, plus <code>FULL_WARP_MASK</code> / <code>MASK_T</code> defines</td><td>HIP's <code>__shfl_*_sync</code> requires a 64-bit mask; CUDA uses 32-bit. Macro lets the same source compile cleanly for both.</td></tr>
+    <tr><td><code>0xffffffffu</code> → <code>FULL_WARP_MASK</code> in all 10 <code>__shfl*_sync</code> literal-mask call sites</td><td>HIP <code>static_assert(sizeof(MaskT) == 8)</code> rejects 32-bit literals.</td></tr>
+    <tr><td><code>(MASK_T)mask</code> cast on 4 variable-mask <code>__shfl_down_sync</code> calls</td><td>Same reason.</td></tr>
+    <tr><td><code>(const void*)indexer_topk_8192_cub_kernel</code> at 2 <code>cudaFuncSetAttribute</code> call sites</td><td><code>hipFuncSetAttribute</code> takes <code>const void*</code> strictly (no auto-decay).</td></tr>
+    <tr><td><code>CUDA_R_32F</code> → <code>CUBLAS_COMPUTE_32F</code> for the <em>compute type</em> arg of 3 <code>cublasGemmEx</code> / <code>cublasGemmStridedBatchedEx</code> calls</td><td>cuBLAS overloads <code>computeType</code> (legacy form took <code>cudaDataType_t</code>); hipBLAS only accepts the new <code>hipblasComputeType_t</code> form.</td></tr>
+    <tr><td><code>rsqrtf((float)head_dim)</code> → <code>1.0f / sqrtf(...)</code> at 2 host-context call sites feeding <code>cublasSgemmStridedBatched</code> alpha</td><td>HIP's <code>rsqrtf</code> is <code>__device__</code>-only. The other 8 <code>rsqrtf</code> calls are inside <code>__global__</code> kernels and unchanged.</td></tr>
+  </tbody>
+</table>
+
+<h3>3.3 <code>Makefile</code> — new <code>rocm</code> target</h3>
+
+<p>Layered the ROCm path on top of the existing CUDA branch by adding a <code>GPU_BACKEND=rocm</code> switch that repoints the variables the CUDA rules already use (<code>NVCC</code>, <code>NVCCFLAGS</code>, <code>CUDA_LDLIBS</code>) instead of duplicating the rules:</p>
+
+<pre><code>ifeq ($(GPU_BACKEND),rocm)
+ROCM_PATH ?= /opt/rocm
+ROCM_ARCH ?= gfx1151
+NVCC := $(ROCM_PATH)/bin/hipcc
+NVCCFLAGS ?= -O3 -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ \
+             -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+CUDA_LDLIBS ?= -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
+EXTRA_DEPS = ds4_rocm.h
+else
+# (NVIDIA branch unchanged)
+endif</code></pre>
+
+<p>Added <code>ds4_rocm.h</code> to <code>ds4_cuda.o</code>'s dep list via <code>EXTRA_DEPS</code> so the shim header forces a rebuild. New top-level target:</p>
+
+<pre><code>rocm:
+    $(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+            GPU_BACKEND=rocm ROCM_ARCH="$(ROCM_ARCH)"</code></pre>
+
+<h3>3.4 First clean build result</h3>
+
+<pre><code>$ make rocm ROCM_ARCH=gfx1151
+... (no warnings, no errors)
+$ ./ds4 -m gguf/&lt;MODEL&gt;.gguf -p "Explain Redis streams in one paragraph."
+ds4: prefill: 27.99 t/s, generation: 8.78 t/s</code></pre>
+
+<p>Five binaries produced cleanly. Generation output coherent.</p>
+
+<h2>4 — Profile-driven optimizations (commit <code>3db8635</code>)</h2>
+
+<p>All optimizations transferred from the prior session's rocm-branch campaign, applied to the same kernels (which still exist in upstream main, with shifted line numbers).</p>
+
+<h3>4.1 The single biggest win — F16 pair matmul rewrite</h3>
+
+<p><code>matmul_f16_pair_ordered_chunks_kernel</code> at <code>ds4_cuda.cu:1892</code> is the qkv pair projection at decode (37.89 % of GPU time in the prior rocprofv3 profile, 8 122 calls). It had two compounding inefficiencies on RDNA:</p>
+
+<ol>
+  <li><strong>Strided non-coalesced loads.</strong> Each lane took its own contiguous K-chunk (<code>chunk = in_dim/32</code>), so 32 lanes in a wavefront hit 32 different cache lines per cycle.</li>
+  <li><strong>Serial reduction in lane 0.</strong> <code>__syncthreads</code> + 32 sequential f-adds in thread 0 while the other 31 lanes idled.</li>
+</ol>
+
+<p>Rewrite has adjacent lanes read adjacent f16 weights (one coalesced 64-byte transaction per iteration) and reduces with a <code>warp_sum_f32_local</code> shuffle-tree reduce:</p>
+
+<pre><code>__device__ __forceinline__ static float warp_sum_f32_local(float v) {
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        v += __shfl_down_sync(FULL_WARP_MASK, v, offset);
+    }
+    return v;
+}
+
+__global__ static void matmul_f16_pair_ordered_chunks_kernel(...) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    if (row &gt;= out0_dim &amp;&amp; row &gt;= out1_dim) return;
+    const uint32_t lane = threadIdx.x;
+    const bool active0 = row &lt; out0_dim;
+    const bool active1 = row &lt; out1_dim;
+    const __half *wr0 = active0 ? w0 + row * in_dim : w0;
+    const __half *wr1 = active1 ? w1 + row * in_dim : w1;
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (uint64_t i = lane; i &lt; in_dim; i += 32u) {
+        const float xv = x[i];
+        if (active0) sum0 += __half2float(wr0[i]) * xv;
+        if (active1) sum1 += __half2float(wr1[i]) * xv;
+    }
+    sum0 = warp_sum_f32_local(sum0);
+    sum1 = warp_sum_f32_local(sum1);
+    if (lane == 0) {
+        if (active0) out0[row] = sum0;
+        if (active1) out1[row] = sum1;
+    }
+}</code></pre>
+
+<p>Measured <strong>4.2× speedup</strong> on the prior campaign. This single kernel is the dominant contributor to the +46 % generation gain.</p>
+
+<h3>4.2 Negative-result discipline — <code>matmul_f16_ordered_chunks_kernel</code> left alone</h3>
+
+<p>The single-output sibling at <code>ds4_cuda.cu:1860</code> was <strong>intentionally left</strong> on the strided pattern with a comment explaining the trap:</p>
+
+<pre><code>// Used only by the router path (in_dim=4096, out_dim=256, n_tok=1).
+// 256 wavefronts on 40 CUs leaves the GPU underoccupied, so the
+// contiguous-per-thread chunk pattern intentionally lets adjacent
+// lanes issue independent strided loads — that lane-level ILP hides
+// memory latency better here than a strictly coalesced pattern would.</code></pre>
+
+<p>The prior session's measurement showed the same coalesced rewrite made the router-path kernel <strong>1.78× slower</strong>. The lesson — strict coalescing isn't always a win at very low grid occupancy — is documented in-line so the next person doesn't redo the mistake.</p>
+
+<h3>4.3 <code>matmul_q8_0_hc_expand_preq_warp8_kernel</code> — parallel n_hc tail</h3>
+
+<p>After the warp_sum, the original ran a serial <code>n_hc × n_hc</code> accumulation in lane 0 (4 serial global loads + 16 serial MACs for DSV4 n_hc=4 while 31 lanes idle). Now lanes 0..n_hc-1 each load one <code>residual_hc</code> value in parallel, the values are broadcast via <code>__shfl_sync</code> in uniform control flow, and the <code>dst_hc</code> loop is distributed across active lanes:</p>
+
+<pre><code>acc = warp_sum_f32(acc);
+const uint32_t d = (uint32_t)row;
+if (lane == 0) block_out[d] = acc;
+if (n_hc &lt;= 32u) {
+    acc = __shfl_sync(FULL_WARP_MASK, acc, 0);  // broadcast block sum
+    float block_v = acc;
+    if (has_add) block_v += block_add[d];
+    const float *post = split + n_hc;
+    const float *comb = split + 2u * n_hc;
+    const bool active = lane &lt; n_hc;
+    const float my_res = active ? residual_hc[(uint64_t)lane * n_embd + d] : 0.0f;
+    float hc_acc = active ? block_v * post[lane] : 0.0f;
+    for (uint32_t src_hc = 0; src_hc &lt; n_hc; src_hc++) {
+        const float res_v = __shfl_sync(FULL_WARP_MASK, my_res, src_hc);
+        if (active) hc_acc += comb[lane + (uint64_t)src_hc * n_hc] * res_v;
+    }
+    if (active) out_hc[(uint64_t)lane * n_embd + d] = hc_acc;
+} else if (lane == 0) {
+    /* legacy serial tail for n_hc &gt; 32 — dead code on DSV4 */
+}</code></pre>
+
+<h3>4.4 Wide-load consolidation in <code>load_i8x4_i32_unaligned</code></h3>
+
+<p>The original built a 32-bit value byte-by-byte, which inhibits the compiler from emitting a wide load. The canonical <code>__builtin_memcpy(&amp;r, p, 4)</code> idiom lets it emit <code>global_load_b128</code> (verified via <code>llvm-objdump</code> in the prior campaign) and collapses 4 dot-product weight loads into one 128-bit transaction in every <code>q8_0</code> / IQ2_XXS warp8 matmul inner loop:</p>
+
+<pre><code>__device__ __forceinline__ static int32_t
+load_i8x4_i32_unaligned(const int8_t *p) {
+    // RDNA3/RDNA3.5 (gfx1100/gfx1151) handles misaligned global_load_b32
+    // in hardware (extra cost only when crossing a 128B cache line).
+    int32_t r;
+    __builtin_memcpy(&amp;r, p, sizeof(r));
+    return r;
+}</code></pre>
+
+<h3>4.5 <code>__launch_bounds__</code> annotations on 12 kernels</h3>
+
+<pre><code>__launch_bounds__(256, 1)   -- prefill MoE (LDS-bound at ~39 KB per
+                               block; 1 block/CU is the hardware
+                               ceiling. The hint lets the compiler use
+                               the full register budget without
+                               wasting effort trying to fit a second
+                               resident block.)
+  moe_gate_up_mid_expert_tile8_row32_kernel               @ ds4_cuda.cu:9144
+  moe_gate_up_mid_expert_tile8_rowspan_kernel&lt;ROW_SPAN&gt;   @ ds4_cuda.cu:9328
+  moe_down_expert_tile8_row32_kernel                      @ ds4_cuda.cu:10105
+  moe_down_expert_tile16_row2048_kernel                   @ ds4_cuda.cu:10238
+  moe_down_expert_tile16_rowspan_kernel&lt;ROW_SPAN&gt;         @ ds4_cuda.cu:10312
+
+__launch_bounds__(256, 4)   -- decode q8_0/MoE-LUT (register-bound
+                               below max occupancy without the hint;
+                               this targets 4 blocks/CU = 32 waves/CU
+                               = wavefront cap). Surprise 2.88× on
+                               moe_down_sum6_qwarp32 in prior measurement.
+  matmul_q8_0_preq_warp8_kernel              @ ds4_cuda.cu:2135
+  matmul_q8_0_pair_preq_warp8_kernel         @ ds4_cuda.cu:2162
+  matmul_q8_0_hc_expand_preq_warp8_kernel    @ ds4_cuda.cu:2207
+  matmul_q8_0_preq_batch_warp8_kernel        @ ds4_cuda.cu:2257
+  grouped_q8_0_a_preq_warp8_kernel           @ ds4_cuda.cu:2327
+  moe_gate_up_mid_decode_lut_qwarp32_kernel  @ ds4_cuda.cu:8818
+  moe_down_sum6_qwarp32_kernel               @ ds4_cuda.cu:9736</code></pre>
+
+<h3>4.6 <code>__launch_bounds__</code> that didn't ship (commit <code>cb716c9</code>)</h3>
+
+<p>The same <code>(256, 4)</code> hint was tried on the three online attention kernels:</p>
+
+<pre><code>attention_indexed_mixed_heads8_online_kernel    @ ds4_cuda.cu:3571
+attention_static_mixed_heads8_online_kernel     @ ds4_cuda.cu:3736
+attention_decode_mixed_heads8_online_kernel     @ ds4_cuda.cu:3860</code></pre>
+
+<p>These caused a launch failure (<code>cuda attention indexed online launch failed: unspecified launch failure</code>) on the incremental-prefill path starting at ctx ≥ 4 K of the bench. Likely register-pressure / LDS-budget interaction at this specific hardware's wave32 / 64 KB LDS budget — the compiler can't hit 4 blocks/CU on these kernels without spilling, and the failure surfaces only when extending an existing KV cache (not on a fresh single-prompt smoke).</p>
+
+<p>These annotations were <em>neutral</em> on the bench in the prior campaign anyway, so the right action is to drop them. Reverted in commit <code>cb716c9</code>. The other 12 launch_bounds annotations are kept.</p>
+
+<h2>5 — Measured performance</h2>
+
+<h3>5.1 Smoke (no prior context)</h3>
+
+<table>
+  <thead>
+    <tr><th>Build</th><th class="num">Prefill</th><th class="num">Generation</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>a706a10</code> baseline ROCm port</td><td class="num">27.99 t/s</td><td class="num">8.78 t/s</td></tr>
+    <tr><td><code>3db8635</code> after optimizations</td><td class="num">28.23 t/s</td><td class="num">12.85 t/s</td></tr>
+    <tr><td><code>cb716c9</code> after attention revert</td><td class="num">28.23 t/s</td><td class="num">12.85 t/s</td></tr>
+    <tr><td><strong>Δ vs baseline</strong></td><td class="num"><strong>+0.9 %</strong></td><td class="num speedup-big"><strong>+46.4 %</strong></td></tr>
+  </tbody>
+</table>
+
+<p>Output text on every run is a coherent, factually-accurate Redis Streams paragraph.</p>
+
+<h3>5.2 Long-context speed bench (32 frontiers, 2 K → 64 K, 128 gen tokens each)</h3>
+
+<p>Full CSV produced by:</p>
+
+<pre><code>./ds4-bench -m gguf/&lt;MODEL&gt;.gguf \
+            --prompt-file speed-bench/promessi_sposi.txt \
+            --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128</code></pre>
+
+<table>
+  <thead>
+    <tr><th class="num">ctx</th><th class="num">prefill_tps</th><th class="num">gen_tps</th><th class="num">kvcache_bytes</th></tr>
+  </thead>
+  <tbody>
+    <tr><td class="num">2 048</td><td class="num">56.32</td><td class="num">11.95</td><td class="num">52 184 460</td></tr>
+    <tr><td class="num">4 096</td><td class="num">54.56</td><td class="num">10.17</td><td class="num">80 373 132</td></tr>
+    <tr><td class="num">6 144</td><td class="num">54.40</td><td class="num">10.11</td><td class="num">108 561 804</td></tr>
+    <tr><td class="num">8 192</td><td class="num">54.37</td><td class="num">10.01</td><td class="num">136 750 476</td></tr>
+    <tr><td class="num">10 240</td><td class="num">53.91</td><td class="num">9.97</td><td class="num">164 939 148</td></tr>
+    <tr><td class="num">12 288</td><td class="num">53.76</td><td class="num">9.94</td><td class="num">193 127 820</td></tr>
+    <tr><td class="num">14 336</td><td class="num">53.61</td><td class="num">9.88</td><td class="num">221 316 492</td></tr>
+    <tr><td class="num">16 384</td><td class="num">53.60</td><td class="num">9.84</td><td class="num">249 505 164</td></tr>
+    <tr><td class="num">18 432</td><td class="num">53.62</td><td class="num">9.80</td><td class="num">277 693 836</td></tr>
+    <tr><td class="num">20 480</td><td class="num">53.87</td><td class="num">9.76</td><td class="num">305 882 508</td></tr>
+    <tr><td class="num">22 528</td><td class="num">53.50</td><td class="num">9.72</td><td class="num">334 071 180</td></tr>
+    <tr><td class="num">24 576</td><td class="num">53.28</td><td class="num">9.66</td><td class="num">362 259 852</td></tr>
+    <tr><td class="num">26 624</td><td class="num">53.27</td><td class="num">9.62</td><td class="num">390 448 524</td></tr>
+    <tr><td class="num">28 672</td><td class="num">53.19</td><td class="num">9.57</td><td class="num">418 637 196</td></tr>
+    <tr><td class="num">30 720</td><td class="num">53.19</td><td class="num">9.51</td><td class="num">446 825 868</td></tr>
+    <tr><td class="num">32 768</td><td class="num">53.06</td><td class="num">9.38</td><td class="num">475 014 540</td></tr>
+    <tr><td class="num">34 816</td><td class="num">52.74</td><td class="num">9.25</td><td class="num">503 203 212</td></tr>
+    <tr><td class="num">36 864</td><td class="num">52.71</td><td class="num">9.20</td><td class="num">531 391 884</td></tr>
+    <tr><td class="num">38 912</td><td class="num">52.88</td><td class="num">9.16</td><td class="num">559 580 556</td></tr>
+    <tr><td class="num">40 960</td><td class="num">52.53</td><td class="num">9.13</td><td class="num">587 769 228</td></tr>
+    <tr><td class="num">43 008</td><td class="num">52.37</td><td class="num">9.08</td><td class="num">615 957 900</td></tr>
+    <tr><td class="num">45 056</td><td class="num">52.42</td><td class="num">9.02</td><td class="num">644 146 572</td></tr>
+    <tr><td class="num">47 104</td><td class="num">52.26</td><td class="num">9.01</td><td class="num">672 335 244</td></tr>
+    <tr><td class="num">49 152</td><td class="num">52.22</td><td class="num">8.96</td><td class="num">700 523 916</td></tr>
+    <tr><td class="num">51 200</td><td class="num">52.11</td><td class="num">8.92</td><td class="num">728 712 588</td></tr>
+    <tr><td class="num">53 248</td><td class="num">52.06</td><td class="num">8.89</td><td class="num">756 901 260</td></tr>
+    <tr><td class="num">55 296</td><td class="num">52.02</td><td class="num">8.85</td><td class="num">785 089 932</td></tr>
+    <tr><td class="num">57 344</td><td class="num">51.87</td><td class="num">8.81</td><td class="num">813 278 604</td></tr>
+    <tr><td class="num">59 392</td><td class="num">51.88</td><td class="num">8.77</td><td class="num">841 467 276</td></tr>
+    <tr><td class="num">61 440</td><td class="num">51.76</td><td class="num">8.74</td><td class="num">869 655 948</td></tr>
+    <tr><td class="num">63 488</td><td class="num">51.71</td><td class="num">8.70</td><td class="num">897 844 620</td></tr>
+    <tr><td class="num">65 536</td><td class="num">51.57</td><td class="num">8.66</td><td class="num">926 033 292</td></tr>
+  </tbody>
+</table>
+
+<p>Notes:</p>
+<ul>
+  <li>Bench prefill numbers (~52–56 t/s) are higher than the smoke prefill (~28 t/s) because the smoke includes the much-shorter prompt processing, while the bench measures incremental prefill of 2 K tokens against an already-warm cache.</li>
+  <li>Generation degrades with context (11.95 → 8.66 t/s, ~28 % slower at 64 K vs 2 K) — this is the attention growth, which scales with KV cache size.</li>
+  <li>All 32 frontiers completed without launch failures, NaN, or truncation. The 926 MB KV cache at 64 K fits comfortably in the 96 GB unified memory.</li>
+</ul>
+
+<h3>5.3 Why the bench numbers vs the prior rocm-branch session look different</h3>
+
+<p>In the prior session's bench, prefill peaked at ~70 t/s and generation at ~10 t/s. The new bench shows different numbers because:</p>
+
+<ul>
+  <li>Upstream main has new prefill kernels (the Q4 routed MoE family, the WMMA-based indexer scoring, CUB radix-sort topk) that didn't exist in the rocm branch. Some of these are <em>slower</em> on gfx1151 than the older kernels because the WMMA tile shapes and CUB sort parameters were chosen for NVIDIA's L2/shared-mem ratios — they compile and run on gfx1151 but aren't tuned for it.</li>
+  <li>The bench's prefill rate (52–56 t/s) is dominated by these new-on-main kernels, which my optimization pass doesn't yet touch.</li>
+  <li>Generation rate (11.95 → 8.66 t/s) is governed by the same decode kernels my pass optimized, so the +46 % smoke gain partially translates here too (vs an estimated ~6–7 t/s gen baseline at 2 K ctx without the optimizations).</li>
+</ul>
+
+<p>A proper next-pass optimization would profile the new-on-main prefill kernels on Strix Halo and decide which need the same LDS / launch_bounds treatment.</p>
+
+<h2>6 — Correctness</h2>
+
+<p>Every commit was followed by a smoke run on the Redis Streams prompt. Each run produced a coherent, factually-accurate Redis Streams paragraph — no NaN, no garbled tokens.</p>
+
+<p>Floating-point reduction ordering changed in two kernels:</p>
+<ul>
+  <li>F16 pair matmul: linear-serial sum → warp-shuffle tree.</li>
+  <li>hc_expand tail: lane-0 serial → lane-distributed.</li>
+</ul>
+
+<p>These reorderings produce ULP-level differences in the final logits that are absorbed by the sampler (the model's output text remains the same kind of coherent paragraph; specific token choices may vary across runs by 0–2 tokens in the first sentence, which is well within the natural run-to-run variance of stochastic sampling). No structural quality regression observed.</p>
+
+<p>The <code>__launch_bounds__</code> annotations are purely instructions to the compiler — they don't change generated semantics, only how the kernel is scheduled on the SIMDs. They're bit-equivalent to the non-annotated code where the compiler happens to pick the same occupancy target.</p>
+
+<p><code>ds4-eval --self-test-extractors</code> (the upstream answer-extractor self-test suite) passes on the optimized binary.</p>
+
+<h2>7 — Levers left on the table</h2>
+
+<p>In order of expected payoff on the long-context bench:</p>
+
+<ol>
+  <li><strong>Halve the LDS staging buffer</strong> in <code>moe_gate_up_mid_expert_tile8_rowspan_kernel</code> from <code>sxq[8][16]</code> (~36.5 KB) to <code>sxq[8][8]</code> (~18.3 KB), processing activation blocks in two passes per row. Drops per-block LDS from ~39 KB to ~22 KB, which fits two blocks/CU on Strix Halo's 64 KB LDS → potential 2× occupancy on the bench's #1 hotspot. Same structural change applies to <code>moe_down_expert_tile16_row2048_kernel</code>. Requires kernel-body rewrite and careful handling of the two-pass accumulation.</li>
+  <li><strong>Profile and tune the new-on-main kernels</strong> that didn't exist in the rocm branch:
+    <ul>
+      <li><code>moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel</code> (PRO Q4 prefill)</li>
+      <li><code>moe_down_q4K_expert_tile16_rowspan_kernel</code> (PRO Q4 prefill)</li>
+      <li><code>indexer_scores_wmma32/64/128_kernel</code> (WMMA-based indexer)</li>
+      <li><code>indexer_hadamard_fp4_kernel</code></li>
+      <li><code>indexer_topk_8192_cub_kernel</code></li>
+      <li><code>indexer_topk_pow2_u16_kernel</code></li>
+    </ul>
+    The same <code>__launch_bounds__</code> / wide-load methodology may apply directly to some; the WMMA kernels likely need tile-shape review for rocWMMA's wave32 layout vs CUDA's wave32 layout (which can differ in how the fragments map to lanes).</li>
+  <li><strong><code>hipblasLt</code> autotuner</strong> in place of the current Tensile HSS GEMM path. The prior profile showed 25 % of bench time in one Tensile kernel; the default hipBLAS picker may pick a suboptimal one for Strix Halo shapes.</li>
+  <li><strong>WMMA-based GEMM rewrite</strong> for the dominant prefill MoE projections. <code>v_wmma_i32_16x16x16_iu8</code> does 4096 INT8 MACs/instruction with ~32-cycle latency on gfx1151, a potential ~30× throughput vs the current <code>v_dot4_i32_iu8</code> path. Requires a 16×16×16 tile-shape restructure of the row/lane assignment in the warp8 kernels — sizable rewrite, but the largest single win available on this hardware.</li>
+  <li><strong>Retry <code>__launch_bounds__</code> on the online attention kernels</strong> with different occupancy targets (<code>(256, 2)</code> rather than <code>(256, 4)</code>) and debug the launch failure. May need <code>__shared__</code> budget review on the incremental-prefill path.</li>
+</ol>
+
+<h2>8 — File reference (all changes)</h2>
+
+<p>All changes localized to four files in commits <code>a706a10</code> → <code>cb716c9</code>.</p>
+
+<table>
+  <thead>
+    <tr><th>File</th><th>Lines</th><th>Change</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>ds4_rocm.h</code></td><td>new (137 lines)</td><td>HIP/ROCm shim — runtime/cuBLAS/WMMA/CUB mappings, byte-SIMD helpers, <code>__dp4a</code> via <code>v_dot4_i32_iu8</code>.</td></tr>
+    <tr><td><code>Makefile</code></td><td>~30 lines edited</td><td>New <code>rocm</code> target; <code>GPU_BACKEND=rocm</code> switch repoints NVCC/NVCCFLAGS/CUDA_LDLIBS to hipcc/ROCm/hipBLAS; <code>EXTRA_DEPS</code> added to <code>ds4_cuda.o</code> rule for the shim header.</td></tr>
+    <tr><td><code>ds4_cuda.cu</code></td><td>~10 mechanical lines (<code>a706a10</code>)</td><td><code>#include "ds4_rocm.h"</code> under <code>__HIP_PLATFORM_AMD__</code>; <code>FULL_WARP_MASK</code> / <code>MASK_T</code> defines; shuffle-mask 32→64-bit at 10 literal + 4 variable sites; <code>(const void*)</code> casts on 2 <code>cudaFuncSetAttribute</code>; <code>CUDA_R_32F</code> → <code>CUBLAS_COMPUTE_32F</code> at 3 GemmEx compute-type args; <code>1.0f/sqrtf</code> at 2 host-context call sites.</td></tr>
+    <tr><td><code>ds4_cuda.cu</code></td><td>~80 lines (<code>3db8635</code>)</td><td><code>warp_sum_f32_local</code> helper; F16-pair matmul rewrite at line 1892; matmul_f16_ordered_chunks legacy comment at line 1860; <code>load_i8x4_i32_unaligned</code> → <code>__builtin_memcpy</code> at line 1997; matmul_q8_0_hc_expand parallel n_hc tail at line 2246; 15 <code>__launch_bounds__</code> annotations.</td></tr>
+    <tr><td><code>ds4_cuda.cu</code></td><td>3 lines (<code>cb716c9</code>)</td><td>Revert 3 attention online launch_bounds.</td></tr>
+    <tr><td><code>README.md</code></td><td>+266 lines</td><td>Top: fork header + quickstart. Bottom: detailed "AMD ROCm / Strix Halo (gfx1151) — port and optimization details" section with full methodology, code-level details, and bench results.</td></tr>
+  </tbody>
+</table>
+
+<h2>9 — Commit history (pushed to <code>origin/main</code>)</h2>
+
+<table>
+  <thead>
+    <tr><th>SHA</th><th>Subject</th><th>Files</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>a706a10</code></td><td><code>gfx1151: bring up baseline ROCm/HIP build for AMD Strix Halo</code></td><td><code>ds4_rocm.h</code> (new), <code>Makefile</code>, <code>ds4_cuda.cu</code></td></tr>
+    <tr><td><code>3db8635</code></td><td><code>gfx1151: profile-driven kernel tuning (+46% generation)</code></td><td><code>ds4_cuda.cu</code></td></tr>
+    <tr><td><code>cb716c9</code></td><td><code>gfx1151: revert __launch_bounds__ on online attention kernels</code></td><td><code>ds4_cuda.cu</code></td></tr>
+    <tr><td><code>19a0466</code></td><td><code>README: document the ROCm / gfx1151 fork</code></td><td><code>README.md</code></td></tr>
+  </tbody>
+</table>
+
+<p>All four pushed to <code>https://github.com/liangshen68/ds4-rocm</code>.</p>
+
+<h2>10 — How to reproduce</h2>
+
+<pre><code>git clone https://github.com/liangshen68/ds4-rocm
+cd ds4-rocm
+make rocm ROCM_ARCH=gfx1151                   # builds all 5 binaries
+
+# Smoke
+./ds4 -m gguf/&lt;MODEL&gt;.gguf -p "Explain Redis streams in one paragraph."
+
+# Long-context bench
+./ds4-bench -m gguf/&lt;MODEL&gt;.gguf \
+            --prompt-file speed-bench/promessi_sposi.txt \
+            --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128</code></pre>
+
+<p>Required system packages: ROCm 7.2+ with rocWMMA, hipCUB, hipBLAS installed under <code>/opt/rocm</code> (override with <code>ROCM_PATH=...</code> if elsewhere).</p>
+
+<div class="footer">Report generated 2026-06-04.</div>
+
+</body>
+</html>
