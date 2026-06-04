@@ -419,22 +419,102 @@ the "dequant" is just one multiplication per element by the per-block
 FP16 scale. That's cheap enough to make WMMA's compute advantage
 dominate.
 
-### 3.6.4 Real paths to close more gap (deferred — would need a session each)
+### 3.6.4 Investigated next-step ideas (none yielded wins on this hardware)
 
-- **Pre-dequantize IQ2_XXS → FP16 at model load**. Costs ~40 GiB
-  extra unified memory (80 GiB model → ~120 GiB). Tight on a 96 GB
-  Strix Halo but achievable if the user sacrifices some KV cache /
-  prefill chunk headroom. Then the prefill MoE matmul becomes a
-  vanilla FP16 GEMM that cuBLAS/hipBLASLt can run at peak WMMA
-  throughput. Would close most of the prefill gap.
-- **Inline-asm IQ2 LUT decode** using `v_perm_b32` + `v_dot4_i32_iu8`
-  fusion. Would speed up the *scalar* kernel directly (which is
-  already winning, so the entire MoE prefill gets faster). The
-  asm-skills repo has the building blocks.
-- **Multi-pair WMMA**: stack two consecutive expert tiles into one
-  block to fill the N=16 WMMA dimension fully (currently np=8 → 50%
-  utilization). Combined with shared activation dequant, this could
-  recover some of the in-register-reuse advantage.
+After the multi-warp WMMA finding, three more avenues were examined
+in depth. None of them ship; the scalar `tile8_rowspan` kernel remains
+the fastest path for IQ2_XXS MoE on gfx1151.
+
+**Idea 1 — Pre-dequantize IQ2_XXS → FP16 at model load** (rejected
+upstream): would add ~40 GiB of FP16 weights to the 80 GiB IQ2 model,
+total ~120 GiB. Strix Halo has 96 GiB unified memory — doesn't fit
+without sacrificing KV cache headroom that long-context bench needs.
+**Not viable on this platform.**
+
+**Idea 2 — Inline asm for the IQ2 LUT decode hot path** (investigated,
+no win): Dumped the kernel's compiled asm via `hipcc --cuda-device-only
+-S` and counted instructions in the `moe_gate_up_mid_expert_tile8_rowspan_kernel<1024>`
+inner loop:
+
+```
+v_dot4_i32_iu8        1024     (productive work)
+v_bcnt_u32              64     (popcount in sign decode)
+v_mul_lo_u32           210     (incl. *0xff in __vcmpne4)
+v_xor_b32              192
+v_and_b32              644
+v_lshrrev_b32          434
+v_or_b32               468
+s_waitcnt              475     (LDS-read drains)
+```
+
+The `__vcmpne4` shift-OR cascade compiles to exactly 7 ops on gfx1151:
+
+```
+v_and_b32     v1, 0x8040201, v1     ; mask
+v_lshrrev_b32 v2, 1, v1             ; >> 1
+v_or_b32      v1, v2, v1            ;  | a
+v_lshrrev_b32 v2, 2, v1             ; >> 2
+v_or_b32      v1, v2, v1            ;  | a
+v_lshrrev_b32 v2, 4, v1             ; >> 4
+v_or_b32      v1, v2, v1            ;  | a
+v_and_b32     v1, 0x1010101, v1     ; isolate LSB per byte
+```
+
+I tried to find a shorter sequence using `v_perm_b32` (byte-permute):
+it can broadcast bytes from sources but cannot **spread a bit within
+a byte to all 8 bits**, which is the core operation here. AMDGCN has
+no per-byte CMP/SUB instructions either, so `__vsub4` (the SWAR
+per-byte subtract) is also at its minimum 5-op form.
+
+The `(g ^ sm) - sm` sign-application pattern could in principle be
+folded into a `v_perm_b32` byte-selector + a precomputed negated copy
+of `g`, but constructing the negated copy itself needs `__vsub4`
+again — net no savings.
+
+**Result: the IQ2_XXS dequant chain is already at the compiler-optimal
+sweet spot for AMDGCN.** No inline asm shortcut found.
+
+**Idea 3 — tile16 multi-pair WMMA gate_up** (analyzed, projected loss):
+The dispatch already builds `tile16_*` metadata when `n_tokens >= 128`
+(for the down kernels). Extending gate_up to a tile16 WMMA variant
+would fill the WMMA N=16 dimension fully (vs the 50% utilization with
+tile8 + N=8). Per-K-tile cost projection:
+
+```
+                weight_dequant  act_dequant  WMMA       per_pair_cost
+tile8 (np=8)    16r * 32K       8p * 32K     4 calls    1.0
+tile16 (np=16)  16r * 32K       16p * 32K    4 calls    0.75   (25% improvement)
+```
+
+Apply on top of the measured multi-warp WMMA: 34 t/s × 1.33 = ~45 t/s.
+Scalar baseline at the same shape: 72 t/s. **Projected tile16 WMMA is
+still ~37% slower than scalar.** Not worth implementing.
+
+### 3.6.5 The structural finding
+
+For IQ2_XXS MoE on gfx1151:
+
+- **Scalar dp4a with in-register weight reuse across pairs is the
+  optimal approach.** The reuse advantage (decode each weight byte
+  once, dp4a it against 8 pair activations) outweighs WMMA's compute
+  throughput advantage.
+- **WMMA can't match this reuse** because A fragments must come from
+  LDS, forcing one full dequant per K-tile that gets consumed by one
+  WMMA call.
+- **Inline asm cannot meaningfully shrink the dequant chain** on
+  AMDGCN — `__vcmpne4` is at 7 ops, `__vsub4` at 5, neither has a
+  shorter equivalent.
+
+The remaining 3.1× prefill gap to M4 Max at 64 K is essentially
+**Apple's higher memory bandwidth** (546 GB/s vs Strix Halo's 256
+GB/s = 2.13× ratio) plus their FP16 weight format (M4 Max runs the
+GGUF model in a different precision that fits in the unified memory
+without IQ2_XXS-style on-the-fly dequant).
+
+The only architectural fix on Strix Halo would be a **different
+quantization format** that's WMMA-friendly while keeping memory low
+(e.g., direct FP4 or FP6 weights that load straight to WMMA fragments
+without a LUT decode step). That's a model change, not a kernel change.
 
 ---
 
