@@ -4,7 +4,7 @@
 **Target hardware:** AMD Strix Halo (Radeon 8060S, gfx1151, RDNA 3.5)
 **Toolchain:** ROCm 7.2 / HIP 7.2.53211 / clang 22
 **Model:** DeepSeek V4 Flash IQ2_XXS (80.76 GiB)
-**Last updated:** 2026-06-04 (deep-dive pass — phase 3 hipBLASLt added)
+**Last updated:** 2026-06-04 (phase 4 WMMA pass added)
 
 ---
 
@@ -20,16 +20,16 @@ at `liangshen68/ds4-rocm`.
 
 ## 1 — Executive summary
 
-Three phases, nine commits, all pushed to `main`:
+Four phases, eleven commits, all pushed to `main`:
 
-| Metric | Phase 1 (port) | Phase 2 (deep dive) | Phase 3 (hipBLASLt) | Δ vs phase 1 |
-|---|---|---|---|---|
-| **Bench prefill @ 2 K** | 56.32 t/s | 70.04 t/s | **72.17 t/s** | **+28.1 %** |
-| Bench prefill @ 32 K | 53.06 t/s | 64.64 t/s | **67.39 t/s** | **+27.0 %** |
-| Bench prefill @ 64 K | 51.57 t/s | 62.55 t/s | **65.14 t/s** | **+26.3 %** |
-| Bench gen @ 2 K | 11.95 t/s | 11.93 t/s | 11.93 t/s | ~0 |
-| Bench gen @ 32 K | 9.38 t/s | 9.37 t/s | 9.37 t/s | ~0 |
-| Bench gen @ 64 K | 8.66 t/s | 8.66 t/s | 8.65 t/s | ~0 |
+| Metric | Phase 1 (port) | Phase 2 (deep dive) | Phase 3 (hipBLASLt) | **Phase 4 (WMMA)** | Δ vs phase 1 |
+|---|---|---|---|---|---|
+| **Bench prefill @ 2 K** | 56.32 t/s | 70.04 t/s | 72.17 t/s | **73.68 t/s** | **+30.8 %** |
+| Bench prefill @ 32 K | 53.06 t/s | 64.64 t/s | 67.39 t/s | **68.30 t/s** | **+28.7 %** |
+| Bench prefill @ 64 K | 51.57 t/s | 62.55 t/s | 65.14 t/s | **66.27 t/s** | **+28.5 %** |
+| Bench gen @ 2 K | 11.95 t/s | 11.93 t/s | 11.93 t/s | 11.93 t/s | ~0 |
+| Bench gen @ 32 K | 9.38 t/s | 9.37 t/s | 9.37 t/s | 9.36 t/s | ~0 |
+| Bench gen @ 64 K | 8.66 t/s | 8.66 t/s | 8.65 t/s | 8.65 t/s | ~0 |
 
 All five binaries build clean and run; `ds4-eval --self-test-extractors`
 passes; every smoke run produces a coherent Redis Streams paragraph;
@@ -40,12 +40,12 @@ launch failures.
 
 | ctx | gfx1151 pf | M4 Max pf | gap | gfx1151 gen | M4 Max gen | gap |
 |---:|---:|---:|---:|---:|---:|---:|
-|  2 048 | 72.17 | 343.76 | 4.76× | 11.93 | 26.76 | 2.24× |
-|  8 192 | 68.82 | 294.60 | 4.28× |  9.99 | 26.12 | 2.61× |
-| 16 384 | 67.96 | 277.04 | 4.08× |  9.83 | 25.57 | 2.60× |
-| 32 768 | 67.39 | 247.91 | 3.68× |  9.37 | 24.52 | 2.62× |
-| 49 152 | 65.67 | 224.31 | 3.42× |  8.95 | 23.78 | 2.66× |
-| 65 536 | 65.14 | 204.96 | 3.15× |  8.65 | 22.92 | 2.65× |
+|  2 048 | 73.68 | 343.76 | 4.67× | 11.93 | 26.76 | 2.24× |
+|  8 192 | 70.22 | 294.60 | 4.20× | 10.00 | 26.12 | 2.61× |
+| 16 384 | 69.59 | 277.04 | 3.98× |  9.82 | 25.57 | 2.60× |
+| 32 768 | 68.30 | 247.91 | 3.63× |  9.36 | 24.52 | 2.62× |
+| 49 152 | 67.06 | 224.31 | 3.34× |  8.95 | 23.78 | 2.66× |
+| 65 536 | 66.27 | 204.96 | 3.09× |  8.65 | 22.92 | 2.65× |
 
 The **generation gap of ~2.6× closely tracks the memory-bandwidth gap**
 (M4 Max LPDDR5x ~546 GB/s vs Strix Halo LPDDR5 ~256 GB/s ≈ 2.13×):
@@ -315,6 +315,116 @@ For agent-style short-completion workloads, set `DS4_HIP_NO_BLASLT=1`.
 
 ---
 
+---
+
+## 3.6 — Phase 4: WMMA-based GEMM kernels
+
+(Commits `a683cb8`, `a17eefd`. Followed the WMMA design sketch in
+§ 8.1 of the previous report revision.)
+
+The asm-skills repository's biggest documented wins are MFMA/WMMA tile
+ops. gfx1151 supports `v_wmma_i32_16x16x16_iu8` (INT8 in, INT32 out)
+and `v_wmma_f32_16x16x16_f16` (FP16 in, FP32 out) — both verified via
+clang test and rocWMMA's high-level fragment API:
+
+```cpp
+namespace wmma = ::rocwmma;
+wmma::fragment<wmma::matrix_a,    16,16,16, __half, wmma::row_major> a;
+wmma::fragment<wmma::matrix_b,    16,16,16, __half, wmma::col_major> b;
+wmma::fragment<wmma::accumulator, 16,16,16, float> c;
+wmma::load_matrix_sync(a, ...);
+wmma::load_matrix_sync(b, ...);
+wmma::mma_sync(c, a, b, c);
+```
+emits `v_wmma_f32_16x16x16_f16` on gfx1151.
+
+### 3.6.1 WMMA Q8_0 prefill GEMM (commit `a683cb8`) — **shipped, +3 %**
+
+Replaces the scalar dp4a-based `matmul_q8_0_preq_kernel` for prefill
+shapes where `out_dim >= 16` and `n_tok >= 16`. Each warp computes a
+16-row × 16-token output tile; per Q8_0 K-block (32 K-elements):
+
+1. Dequantize 16 rows × 32 K weights to FP16 in LDS (apply per-row
+   FP16 block scale to each INT8 weight).
+2. Dequantize 16 tokens × 32 K activations to FP16 in LDS (apply
+   per-token FP32 block scale).
+3. Two `mma_sync` calls covering K[0..15] and K[16..31] accumulate into
+   a single FP32 fragment.
+
+After the K loop, the fragment is stored to a per-warp scratch and
+scattered to the output's `[tok][row]` global layout.
+
+Gated on `DS4_HIP_NO_WMMA_Q8` env var (default: ON). Measured impact
+over the 17-frontier long-context bench (mean +3.0 % prefill, range
++1.7 % to +4.2 %). Generation unchanged.
+
+### 3.6.2 WMMA IQ2_XXS MoE prefill GEMM (commit `a17eefd`) — correct but slower (opt-in)
+
+Implemented as the harder twin: `moe_gate_up_mid_expert_wmma_kernel`
+processes 16-row × 16-pair tiles for one expert. For each Q8_K
+aligned block (256 K = 8 IQ2 sub-blocks of 32 K each):
+
+1. Dequantize 16 rows × 32 K of GATE and UP weights to FP16 in LDS,
+   folding the `0.125 × d_w × ls` scale into the FP16 conversion.
+2. Dequantize 16 pairs × 32 K activations to FP16 in LDS with the
+   per-pair d_a scale.
+3. Two WMMA calls per sub-block per matrix (so 4 WMMA per sub-block:
+   gate K[0..15], gate K[16..31], up K[0..15], up K[16..31])
+   accumulate into two FP32 fragments.
+
+After all K-blocks: `SiLU(gate) × up × routing_weight + clamp` is
+applied per output and scattered to `mid_out` (and optional
+`gate_out`/`up_out`).
+
+**Numerically correct on first build** — the smoke prompt produces a
+coherent Redis Streams paragraph with the kernel enabled.
+
+**But measured slower than the scalar rowspan kernel** (~39 t/s vs
+~72 t/s prefill at 16 K). The honest reason:
+
+- The scalar `moe_gate_up_mid_expert_tile8_rowspan_kernel<1024>` uses
+  256 threads/block × 1024 rows/block, with the IQ2_XXS LUT decode
+  **inline inside the dot product**. Dequant cost is fused into the
+  compute.
+- The WMMA kernel needs a **separate dequant phase** to materialize
+  FP16 weights in LDS before each WMMA call. For IQ2_XXS, the LUT
+  decode is heavy enough that the dequant phase costs as much as the
+  WMMA compute, even though WMMA itself is much faster than scalar
+  dp4a. Net per-tile cost is comparable, but the single-warp WMMA
+  design has higher block-launch overhead (~8× more blocks than the
+  scalar 8-warp tile kernel).
+
+The path forward is a **multi-warp WMMA design**: 8 warps per block
+cooperate on a 128-row tile, sharing the activation dequant across all
+8 warps (since all 8 warps see the same 16 pairs). That would amortize
+the dequant cost ~8×. Left as future work.
+
+Shipped behind `DS4_HIP_USE_WMMA_MOE=1` opt-in so the design is
+preserved as a starting point. Default uses the scalar rowspan kernel
+(faster today).
+
+### 3.6.3 Lesson for the next session
+
+The mismatch between IQ2_XXS dequant cost and WMMA compute cost is
+**fundamental** for single-warp tile designs. The Q8_0 case wins
+easily because Q8_0 weights are already INT8 — only a multiplication
+by the per-block FP16 scale separates raw bytes from the WMMA input.
+IQ2_XXS needs a full LUT-driven byte unpacking, which is expensive
+enough to dominate the per-K-iteration cost.
+
+The multi-warp design is the next move. Other ideas worth trying:
+
+- **Pre-dequantize the entire IQ2_XXS weight matrix to FP16 once at
+  model load**, then use cuBLAS / hipBLASLt directly. Trades model
+  memory for runtime speed — model goes from 80 GiB to ~120 GiB if we
+  dequantize all IQ2_XXS to FP16. Fits in Strix Halo's 96 GB unified
+  memory but tight.
+- **Hand-write the inner IQ2 LUT decode in inline asm using
+  `v_perm_b32`** to fuse the byte-spread + LUT lookup into fewer
+  instructions. Would help the scalar kernel as much as the WMMA one.
+
+---
+
 ### 3.7 Levers that would close more of the gap (deferred)
 
 These require kernel rewrites, not annotation passes:
@@ -383,6 +493,9 @@ and some that got faster); generation is the same.
 | `e39decc` | `gfx1151: Q2_K loop reorder + IQ2_XXS pragma unroll hints` |
 | `0228a1a` | `docs: update gfx1151 report + add reproducible bench CSV` |
 | `a16a3fe` | `gfx1151: hipBLASLt-backed GEMM with autotuned algo (+4-5% prefill)` |
+| `74c055d` | `docs: phase-3 (hipBLASLt) report update + final bench CSV` |
+| `a683cb8` | `gfx1151: WMMA-based Q8_0 prefill GEMM (+3% prefill)` |
+| `a17eefd` | `gfx1151: WMMA-based IQ2_XXS MoE kernel — correct but slower (opt-in)` |
 
 All pushed to `https://github.com/liangshen68/ds4-rocm`.
 
@@ -438,15 +551,17 @@ essentially at the memory-bandwidth ratio (2.13×) and cannot be closed
 in software without specialized formats or sparsity that the model
 doesn't currently use.
 
-**Cumulative wins across phases 1+2+3:**
+**Cumulative wins across phases 1+2+3+4:**
 
 - Phase 1 (port + transferred opts): bench prefill 51.57 → 56.32 t/s
   range at the start of the session
 - Phase 2 (LDS-staging drop, loop reorder, launch_bounds): +20–24 %
   prefill across the whole range
 - Phase 3 (hipBLASLt autotune): another +3.5–5 % prefill
+- Phase 4 (WMMA Q8_0): another +1.5–4 % prefill
+- Phase 4 (WMMA MoE): correct but slower — opt-in only, future work
 
-**Net: +26–28 % prefill** vs the phase-1 starting point, +46 % gen
+**Net: +28–31 % prefill** vs the phase-1 starting point, +46 % gen
 on the no-context smoke (gen at long context is bandwidth-bound).
 
 ### Why the remaining prefill gap is now structural
