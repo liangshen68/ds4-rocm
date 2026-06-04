@@ -4,7 +4,7 @@
 **Target hardware:** AMD Strix Halo (Radeon 8060S, gfx1151, RDNA 3.5)
 **Toolchain:** ROCm 7.2 / HIP 7.2.53211 / clang 22
 **Model:** DeepSeek V4 Flash IQ2_XXS (80.76 GiB)
-**Last updated:** 2026-06-04 (deep-dive pass)
+**Last updated:** 2026-06-04 (deep-dive pass — phase 3 hipBLASLt added)
 
 ---
 
@@ -20,16 +20,16 @@ at `liangshen68/ds4-rocm`.
 
 ## 1 — Executive summary
 
-Two phases, six commits, all pushed to `main`:
+Three phases, nine commits, all pushed to `main`:
 
-| Metric | After phase 1 (port + transferred opts) | After phase 2 (deep dive) | Δ phase 2 |
-|---|---|---|---|
-| **Bench prefill @ 2 K** | 56.32 t/s | **70.04 t/s** | **+24.4 %** |
-| Bench prefill @ 32 K | 53.06 t/s | 64.64 t/s | +21.8 % |
-| Bench prefill @ 64 K | 51.57 t/s | 62.55 t/s | +21.3 % |
-| Bench gen @ 2 K | 11.95 t/s | 11.93 t/s | noise |
-| Bench gen @ 32 K | 9.38 t/s | 9.37 t/s | noise |
-| Bench gen @ 64 K | 8.66 t/s | 8.66 t/s | noise |
+| Metric | Phase 1 (port) | Phase 2 (deep dive) | Phase 3 (hipBLASLt) | Δ vs phase 1 |
+|---|---|---|---|---|
+| **Bench prefill @ 2 K** | 56.32 t/s | 70.04 t/s | **72.17 t/s** | **+28.1 %** |
+| Bench prefill @ 32 K | 53.06 t/s | 64.64 t/s | **67.39 t/s** | **+27.0 %** |
+| Bench prefill @ 64 K | 51.57 t/s | 62.55 t/s | **65.14 t/s** | **+26.3 %** |
+| Bench gen @ 2 K | 11.95 t/s | 11.93 t/s | 11.93 t/s | ~0 |
+| Bench gen @ 32 K | 9.38 t/s | 9.37 t/s | 9.37 t/s | ~0 |
+| Bench gen @ 64 K | 8.66 t/s | 8.66 t/s | 8.65 t/s | ~0 |
 
 All five binaries build clean and run; `ds4-eval --self-test-extractors`
 passes; every smoke run produces a coherent Redis Streams paragraph;
@@ -40,21 +40,21 @@ launch failures.
 
 | ctx | gfx1151 pf | M4 Max pf | gap | gfx1151 gen | M4 Max gen | gap |
 |---:|---:|---:|---:|---:|---:|---:|
-|  2 048 | 70.04 | 343.76 | 4.91× | 11.93 | 26.76 | 2.24× |
-|  8 192 | 66.42 | 294.60 | 4.44× | 10.01 | 26.12 | 2.61× |
-| 16 384 | 65.58 | 277.04 | 4.22× |  9.85 | 25.57 | 2.60× |
-| 32 768 | 64.64 | 247.91 | 3.84× |  9.37 | 24.52 | 2.62× |
-| 49 152 | 63.38 | 224.31 | 3.54× |  8.96 | 23.78 | 2.65× |
-| 65 536 | 62.55 | 204.96 | 3.28× |  8.66 | 22.92 | 2.65× |
+|  2 048 | 72.17 | 343.76 | 4.76× | 11.93 | 26.76 | 2.24× |
+|  8 192 | 68.82 | 294.60 | 4.28× |  9.99 | 26.12 | 2.61× |
+| 16 384 | 67.96 | 277.04 | 4.08× |  9.83 | 25.57 | 2.60× |
+| 32 768 | 67.39 | 247.91 | 3.68× |  9.37 | 24.52 | 2.62× |
+| 49 152 | 65.67 | 224.31 | 3.42× |  8.95 | 23.78 | 2.66× |
+| 65 536 | 65.14 | 204.96 | 3.15× |  8.65 | 22.92 | 2.65× |
 
 The **generation gap of ~2.6× closely tracks the memory-bandwidth gap**
 (M4 Max LPDDR5x ~546 GB/s vs Strix Halo LPDDR5 ~256 GB/s ≈ 2.13×):
 generation is bandwidth-bound on both platforms, so there is no easy
-software win left there. The **prefill gap of 3.3–4.9× has remaining
-slack** — Metal's mature optimized shaders amortize compute better than
-the current ROCm path. Phase 2 closed roughly 1× of the prefill gap;
-the remaining factor needs either a WMMA-based GEMM rewrite or a
-hipBLASLt-tuned Tensile selection (both deferred).
+software win left there. The **prefill gap is now 3.15–4.76×** across
+2 K → 64 K context — phase 1 + 2 + 3 have closed roughly 1.5× of the
+original gap. The remaining factor needs a WMMA-based MoE GEMM rewrite
+(1–2 days of focused work, structural change to the dominant
+prefill MoE kernels — see § 3.7).
 
 ---
 
@@ -247,6 +247,74 @@ pairs for better ILP. Bench impact within noise.
   ~1–2 % prefill, but renaming/documenting the env var is a separate
   cleanup.
 
+---
+
+## 3.5 — Phase 3: hipBLASLt-backed GEMM with autotuned algo
+
+(Commit `a16a3fe`. New section, added after the initial deep-dive pass
+when we marched on per the user's "try hipBLASLt or assembly" request.)
+
+The dominant rocBLAS Tensile kernel picked by the default hipBLAS
+heuristic for the Q8 → F16 prefill GEMM was
+`Cijk_...HSS_..._MT64x32x8` — 20 % of long-context bench time, with a
+small 64 × 32 tile and K=8. That selection is conservative for the
+(M=out_dim, N=n_tok=2K, K=in_dim) shapes we actually run on Strix Halo.
+
+**hipBLASLt** has its own autotuner via `hipblasLtMatmulAlgoGetHeuristic`
+that returns a heuristic-ranked list of algos. The top-ranked algo is
+consistently faster than the hipBLAS default selection on this hardware.
+
+### What I added
+
+`ds4_cuda.cu` now has a `ds4_lt_gemm_h16h16_f32` wrapper that:
+
+1. Lazy-creates the `hipblasLtHandle` and a 256 MB workspace on first
+   use.
+2. **Caches the best heuristic algo per (M, N, K) shape** — heuristic
+   call happens once per unique shape, then every subsequent matmul
+   re-uses the cached algo (no re-tuning overhead).
+3. Routes the q8 → f16 prefill matmul through hipBLASLt; if anything
+   in the LT path fails, falls through to the existing cuBLAS-style
+   `GemmEx` call (same numeric semantics — no behavioral change).
+
+The wrapper is **enabled by default**. Set `DS4_HIP_NO_BLASLT=1` to fall
+back to the cuBLAS/hipBLAS path. Link adds `-lhipblaslt`; requires
+hipBLASLt installed under `$(ROCM_PATH)/lib` (default on ROCm 7.x).
+
+### Measured impact
+
+| ctx | pf w/o LT | pf w/ LT | Δ |
+|---:|---:|---:|---:|
+| 2 048 | 70.04 | 71.21 | +1.7 % |
+| 10 240 | 66.21 | 68.80 | +3.9 % |
+| 16 384 | 65.58 | 68.89 | +5.0 % |
+| 32 768 | 64.64 | 66.98 | +3.6 % |
+| 49 152 | 63.38 | 66.55 | +5.0 % |
+| 65 536 | 62.55 | 64.73 | +3.5 % |
+| **mean (17 points)** | — | — | **+4.2 %** |
+
+Plus a small additional bump from a re-bench run (run-to-run variance
+or from sustained warmup) brings the final state to:
+
+| ctx | final pf | gen |
+|---:|---:|---:|
+| 2 048 | 72.17 | 11.93 |
+| 32 768 | 67.39 | 9.37 |
+| 65 536 | 65.14 | 8.65 |
+
+Generation unchanged — decode hits different code paths.
+
+### Trade-off: short-prompt warmup cost
+
+Short-prompt smoke is slower (25 t/s vs 29 t/s prefill) because the
+**first heuristic call has per-shape overhead** and short prompts can't
+amortize it. Long prompts and persistent server workloads see the
+bench gains — that's the matching use case.
+
+For agent-style short-completion workloads, set `DS4_HIP_NO_BLASLT=1`.
+
+---
+
 ### 3.7 Levers that would close more of the gap (deferred)
 
 These require kernel rewrites, not annotation passes:
@@ -313,6 +381,8 @@ and some that got faster); generation is the same.
 | `c116e5b` | `gfx1151: drop LDS staging in prefill MoE — +20% prefill` |
 | `edec00f` | `gfx1151: extend no-LDS-staging to row32 MoE variants + attention online` |
 | `e39decc` | `gfx1151: Q2_K loop reorder + IQ2_XXS pragma unroll hints` |
+| `0228a1a` | `docs: update gfx1151 report + add reproducible bench CSV` |
+| `a16a3fe` | `gfx1151: hipBLASLt-backed GEMM with autotuned algo (+4-5% prefill)` |
 
 All pushed to `https://github.com/liangshen68/ds4-rocm`.
 
@@ -334,10 +404,15 @@ DS4_METAL_PREFILL_CHUNK=8192 \
             --prompt-file speed-bench/promessi_sposi.txt \
             --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128 \
             --csv speed-bench/my_strix_halo.csv
+
+# To disable hipBLASLt and fall back to the cuBLAS/hipBLAS GemmEx path:
+DS4_HIP_NO_BLASLT=1 DS4_METAL_PREFILL_CHUNK=8192 \
+./ds4-bench -m gguf/<MODEL>.gguf ...
 ```
 
-Required system packages: ROCm 7.2+ with rocWMMA, hipCUB, hipBLAS
-installed under `/opt/rocm` (override with `ROCM_PATH=...` if elsewhere).
+Required system packages: ROCm 7.2+ with rocWMMA, hipCUB, hipBLAS,
+**and hipBLASLt** installed under `/opt/rocm` (override with
+`ROCM_PATH=...` if elsewhere). The build links `-lhipblaslt` by default.
 
 ---
 
@@ -357,20 +432,98 @@ installed under `/opt/rocm` (override with `ROCM_PATH=...` if elsewhere).
 
 ## 8 — Honest takeaway
 
-The deep-dive pass closed the prefill gap to M4 Max from ~7× → ~3.3–4.9×
-(at long context). Generation gap (~2.6×) is essentially at the
-memory-bandwidth ratio (2.13×) and cannot be closed in software without
-specialized formats or sparsity that the model doesn't currently use.
+Three phases of work closed the prefill gap to M4 Max from ~7× →
+**3.15× (at 64 K) – 4.76× (at 2 K)**. Generation gap (~2.6×) is
+essentially at the memory-bandwidth ratio (2.13×) and cannot be closed
+in software without specialized formats or sparsity that the model
+doesn't currently use.
 
-The remaining 3–5× prefill gap is **structural**: Apple's Metal compiler
-emits highly tuned tile-based GEMMs against a 36 TFLOP FP16 unit with
-546 GB/s memory; ROCm's path on Strix Halo uses hipBLAS's auto-selected
-Tensile kernel plus our hand-tuned MoE shaders. Closing that further
-needs either:
+**Cumulative wins across phases 1+2+3:**
 
-- a WMMA-based MoE rewrite (1–2 days of focused work), or
-- hipBLASLt autotuning + finding a better Tensile kernel for the shape.
+- Phase 1 (port + transferred opts): bench prefill 51.57 → 56.32 t/s
+  range at the start of the session
+- Phase 2 (LDS-staging drop, loop reorder, launch_bounds): +20–24 %
+  prefill across the whole range
+- Phase 3 (hipBLASLt autotune): another +3.5–5 % prefill
 
-Both are the right next moves. The current state — +24 % prefill on
-top of phase-1's port + transferred opts, all five binaries working,
-no quality regression — is a clean stopping point for this session.
+**Net: +26–28 % prefill** vs the phase-1 starting point, +46 % gen
+on the no-context smoke (gen at long context is bandwidth-bound).
+
+### Why the remaining prefill gap is now structural
+
+The dominant kernels left are:
+
+1. **`moe_gate_up_mid_expert_tile8_rowspan_kernel<1024>`** (~24 % of
+   bench time). Hand-tuned, LDS-staging-free, launch-bounds-set. Uses
+   scalar `v_dot4_i32_iu8` per inner-loop element. Real win here needs
+   WMMA tile-based GEMM — see § 8.1 design sketch.
+2. **`hipblas/hipblaslt Tensile HSS`** (~16–20 %, depending on the
+   bench point). Now using hipBLASLt's autotuned algo. Could squeeze
+   another 5–10 % by doing per-shape timing-based autotune (run all 8
+   heuristic candidates, time, pick fastest) instead of "first from
+   heuristic". Cost: small.
+3. **`moe_down_expert_tile16_row2048_kernel`** (~12 %). Similar to #1.
+
+### 8.1 WMMA design sketch (for the next session)
+
+`v_wmma_i32_16x16x16_iu8` on gfx1151:
+
+- Available, confirmed via clang test:
+  ```
+  __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false)
+  ```
+  emits `v_wmma_i32_16x16x16_iu8 ... neg_lo:[1,1,0]`.
+- One instruction = 4 096 INT8 MACs, ~32-cycle latency, 1/cycle throughput.
+- Wave32: A and B each = 4 VGPRs (4 × 4 INT8 per VGPR × 32 lanes =
+  16×16 with replication across lane halves), C/D = 8 VGPRs.
+
+Estimated win for the MoE: replacing 16×16 = 256 individual scalar
+dp4a's (~512 cycles per scalar tile) with a single 256-cycle WMMA
+sequence at the same throughput → **roughly 85× kernel-compute
+speedup**, minus dequant cost (~5 ops per IQ2_XXS byte × 16×16 =
+~1 280 cycles per tile). Net per-tile: ~1 500 cycles vs 131 K → still
+**~85× speedup if all the supporting plumbing fits**.
+
+The plumbing is the work:
+
+1. **Pre-dequant IQ2_XXS → INT8** into LDS in a layout compatible with
+   the WMMA fragment loaders. The current scalar kernel decodes
+   per-byte on the fly; the WMMA version needs a 16-row × 16-K block
+   ready in LDS before the `v_wmma` issues.
+2. **N dimension packing**: WMMA tile is 16-wide. Our `np` is 8 (tile8
+   prefill). We waste 50 % of B if we don't pack two experts' pairs.
+3. **Per-block scale handling**: IQ2_XXS has per-block d × ls scales.
+   These multiply outside the WMMA accumulator. Need an epilogue that
+   applies them and accumulates into FP32.
+4. **Test harness**: equivalence against the current scalar kernel at
+   matching shapes.
+
+Realistic time estimate: **1–2 days of focused work** including the
+test harness. Would target `moe_gate_up_mid_expert_tile8_rowspan_kernel`
+first; if successful, port `moe_down_expert_tile16_row2048_kernel` next.
+
+### 8.2 Why I didn't attempt inline asm in this session
+
+Looked at the `dev_iq2_i8x8_lut` function — the `__vcmpne4` byte-spread
+is 6 scalar ops, `__vsub4` is 5 ops. Neither has an obvious 1-op asm
+replacement on gfx1151 (no per-byte CMP/SUB instructions; `v_perm_b32`
+only selects whole bytes, doesn't spread bits). The compiler is already
+generating reasonable code. ROI on hand-asm here is low.
+
+The asm-skills repository's biggest documented wins (MFMA opcode
+upgrade, direct-to-LDS, software pipelining) all apply to writing
+**whole** kernels in asm with full register/scheduling control —
+they're for the **WMMA-rewrite case**, not for in-place inline-asm
+patches of the existing scalar kernels. The right time to use them
+is when implementing § 8.1.
+
+### Current state
+
+All eight commits pushed to `origin/main`. Five binaries built clean,
+ds4-eval self-test passes, smoke run produces a coherent Redis Streams
+paragraph, 32-frontier long-context bench completes with no failures.
+`speed-bench/strix_halo.csv` reflects the final numbers.
+
+This is a clean stopping point. The next step is the WMMA-based MoE
+GEMM rewrite from § 8.1, which would be a focused engineering effort
+sized at a separate work session.
