@@ -358,70 +358,83 @@ Gated on `DS4_HIP_NO_WMMA_Q8` env var (default: ON). Measured impact
 over the 17-frontier long-context bench (mean +3.0 % prefill, range
 +1.7 % to +4.2 %). Generation unchanged.
 
-### 3.6.2 WMMA IQ2_XXS MoE prefill GEMM (commit `a17eefd`) — correct but slower (opt-in)
+### 3.6.2 WMMA IQ2_XXS MoE prefill GEMM (commits `a17eefd`, `a7498a5`) — correct but slower (opt-in)
 
-Implemented as the harder twin: `moe_gate_up_mid_expert_wmma_kernel`
-processes 16-row × 16-pair tiles for one expert. For each Q8_K
-aligned block (256 K = 8 IQ2 sub-blocks of 32 K each):
+Two WMMA-based MoE designs implemented and tested, both numerically
+correct but both slower than the scalar baseline. Shipped opt-in so
+the designs are preserved.
 
-1. Dequantize 16 rows × 32 K of GATE and UP weights to FP16 in LDS,
-   folding the `0.125 × d_w × ls` scale into the FP16 conversion.
-2. Dequantize 16 pairs × 32 K activations to FP16 in LDS with the
-   per-pair d_a scale.
-3. Two WMMA calls per sub-block per matrix (so 4 WMMA per sub-block:
-   gate K[0..15], gate K[16..31], up K[0..15], up K[16..31])
-   accumulate into two FP32 fragments.
+**Single-warp design** (`moe_gate_up_mid_expert_wmma_kernel`, opt-in
+via `DS4_HIP_USE_WMMA_MOE_SW=1`, commit `a17eefd`):
+- One warp per 16-row × 16-pair tile
+- Per K sub-block: dequant 16×32 weights + 16×32 activations to FP16
+  in LDS, then 4 `v_wmma_f32_16x16x16_f16` calls (gate/up × 2 K-halves)
+- Measured **~39 t/s prefill at 16 K vs 72 t/s scalar** (~half speed)
 
-After all K-blocks: `SiLU(gate) × up × routing_weight + clamp` is
-applied per output and scattered to `mid_out` (and optional
-`gate_out`/`up_out`).
+**Multi-warp design** (`moe_gate_up_mid_expert_wmma_mw_kernel`, opt-in
+via `DS4_HIP_USE_WMMA_MOE_MW=1`, commit `a7498a5`):
+- 8 warps × 32 threads per block, each warp handles its own 16-row
+  tile of a shared 128-row block
+- Activation dequant distributed across all 256 threads (since all
+  warps see the same 16 pairs)
+- Each warp dequants its own weights in parallel
+- Measured **~34 t/s prefill at 16 K vs 72 t/s scalar** (~half speed)
 
-**Numerically correct on first build** — the smoke prompt produces a
-coherent Redis Streams paragraph with the kernel enabled.
+### 3.6.3 Why WMMA can't beat scalar on IQ2_XXS MoE (the real reason)
 
-**But measured slower than the scalar rowspan kernel** (~39 t/s vs
-~72 t/s prefill at 16 K). The honest reason:
+After the multi-warp variant also lost, the root cause became clear:
+it's not per-block overhead, it's a **layout-of-reuse mismatch**.
 
-- The scalar `moe_gate_up_mid_expert_tile8_rowspan_kernel<1024>` uses
-  256 threads/block × 1024 rows/block, with the IQ2_XXS LUT decode
-  **inline inside the dot product**. Dequant cost is fused into the
-  compute.
-- The WMMA kernel needs a **separate dequant phase** to materialize
-  FP16 weights in LDS before each WMMA call. For IQ2_XXS, the LUT
-  decode is heavy enough that the dequant phase costs as much as the
-  WMMA compute, even though WMMA itself is much faster than scalar
-  dp4a. Net per-tile cost is comparable, but the single-warp WMMA
-  design has higher block-launch overhead (~8× more blocks than the
-  scalar 8-warp tile kernel).
+The scalar kernel `moe_gate_up_mid_expert_tile8_rowspan_kernel`:
 
-The path forward is a **multi-warp WMMA design**: 8 warps per block
-cooperate on a 128-row tile, sharing the activation dequant across all
-8 warps (since all 8 warps see the same 16 pairs). That would amortize
-the dequant cost ~8×. Left as future work.
+```cpp
+// dev_dot_iq2_xxs_q8_K_block8_deq_lut, per ib32 (one 32-K sub-block):
+dev_iq2_i8x8_lut(...) → produces w[8] in registers
+for (each of 8 pairs) {
+    sumi = __dp4a(w[0], q8[p][0], sumi);  // w stays in registers
+    sumi = __dp4a(w[1], q8[p][1], sumi);  // reused across 8 pairs
+    ... 8 dp4a calls total
+}
+```
 
-Shipped behind `DS4_HIP_USE_WMMA_MOE=1` opt-in so the design is
-preserved as a starting point. Default uses the scalar rowspan kernel
-(faster today).
+The 32 dequantized weight bytes (`w[0..7]` packed as 8 int32s) live in
+registers and are **reused 8 times** — once per pair — within the
+same inner loop. The IQ2_XXS LUT decode happens once per sub-block
+per warp; its cost is amortized 8× across the pair dimension.
 
-### 3.6.3 Lesson for the next session
+WMMA cannot do this in-register reuse. Its A fragment must come from
+LDS (or, in newer instructions, from special "matrix" registers via
+`buffer_load_dwordx4`-like ops). The dequant must materialize its
+output somewhere addressable by the WMMA load. **The store-to-LDS step
+forces a full dequant per K-tile that gets consumed only once by the
+WMMA call** — no amortization across pairs.
 
-The mismatch between IQ2_XXS dequant cost and WMMA compute cost is
-**fundamental** for single-warp tile designs. The Q8_0 case wins
-easily because Q8_0 weights are already INT8 — only a multiplication
-by the per-block FP16 scale separates raw bytes from the WMMA input.
-IQ2_XXS needs a full LUT-driven byte unpacking, which is expensive
-enough to dominate the per-K-iteration cost.
+Net per-tile compute: scalar does dequant once and N=8 pair dp4a's;
+WMMA does dequant once and one N=16 WMMA call (50% N utilization since
+np=8). Roughly equal MAC counts, but WMMA loses the per-tile dequant
+reuse that scalar wins by keeping `w[8]` in registers.
 
-The multi-warp design is the next move. Other ideas worth trying:
+The Q8_0 case in § 3.6.1 wins because Q8_0 weights are already INT8 —
+the "dequant" is just one multiplication per element by the per-block
+FP16 scale. That's cheap enough to make WMMA's compute advantage
+dominate.
 
-- **Pre-dequantize the entire IQ2_XXS weight matrix to FP16 once at
-  model load**, then use cuBLAS / hipBLASLt directly. Trades model
-  memory for runtime speed — model goes from 80 GiB to ~120 GiB if we
-  dequantize all IQ2_XXS to FP16. Fits in Strix Halo's 96 GB unified
-  memory but tight.
-- **Hand-write the inner IQ2 LUT decode in inline asm using
-  `v_perm_b32`** to fuse the byte-spread + LUT lookup into fewer
-  instructions. Would help the scalar kernel as much as the WMMA one.
+### 3.6.4 Real paths to close more gap (deferred — would need a session each)
+
+- **Pre-dequantize IQ2_XXS → FP16 at model load**. Costs ~40 GiB
+  extra unified memory (80 GiB model → ~120 GiB). Tight on a 96 GB
+  Strix Halo but achievable if the user sacrifices some KV cache /
+  prefill chunk headroom. Then the prefill MoE matmul becomes a
+  vanilla FP16 GEMM that cuBLAS/hipBLASLt can run at peak WMMA
+  throughput. Would close most of the prefill gap.
+- **Inline-asm IQ2 LUT decode** using `v_perm_b32` + `v_dot4_i32_iu8`
+  fusion. Would speed up the *scalar* kernel directly (which is
+  already winning, so the entire MoE prefill gets faster). The
+  asm-skills repo has the building blocks.
+- **Multi-pair WMMA**: stack two consecutive expert tiles into one
+  block to fill the N=16 WMMA dimension fully (currently np=8 → 50%
+  utilization). Combined with shared activation dequant, this could
+  recover some of the in-register-reuse advantage.
 
 ---
 
@@ -495,7 +508,9 @@ and some that got faster); generation is the same.
 | `a16a3fe` | `gfx1151: hipBLASLt-backed GEMM with autotuned algo (+4-5% prefill)` |
 | `74c055d` | `docs: phase-3 (hipBLASLt) report update + final bench CSV` |
 | `a683cb8` | `gfx1151: WMMA-based Q8_0 prefill GEMM (+3% prefill)` |
-| `a17eefd` | `gfx1151: WMMA-based IQ2_XXS MoE kernel — correct but slower (opt-in)` |
+| `a17eefd` | `gfx1151: WMMA-based IQ2_XXS MoE kernel (single-warp) — correct but slower (opt-in)` |
+| `eb24e61` | `docs: phase-4 (WMMA) report update` |
+| `a7498a5` | `gfx1151: multi-warp WMMA MoE kernel — correct but still slower (opt-in)` |
 
 All pushed to `https://github.com/liangshen68/ds4-rocm`.
 
