@@ -8170,6 +8170,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
         y4 ? y4->qs : NULL, y5 ? y5->qs : NULL, y6 ? y6->qs : NULL, y7 ? y7->qs : NULL,
     };
+    #pragma unroll 8
     for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
         const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
         const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
@@ -8180,6 +8181,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
         dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
         dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        #pragma unroll 8
         for (uint32_t p = 0; p < n; p++) {
             const int8_t *q = q8[p] + ib32 * 32;
             int32_t sumi = 0;
@@ -8195,6 +8197,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         }
     }
     const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
+    #pragma unroll 8
     for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
 }
 
@@ -8549,26 +8552,37 @@ __device__ static void dev_dot_q2_K_q8_K_block8(
     const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
     int isum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int summs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    #pragma unroll 8
     for (uint32_t p = 0; p < n; p++) {
+        #pragma unroll
         for (int j = 0; j < 16; j++) summs[p] += ys[p]->bsums[j] * (sc[j] >> 4);
     }
-    for (uint32_t p = 0; p < n; p++) {
-        const uint8_t *q2 = x->qs;
-        const int8_t *q8 = ys[p]->qs;
-        int is = 0;
-        for (int k = 0; k < CUDA_QK_K / 128; k++) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                int d = sc[is++] & 0x0f;
-                isum[p] += d * dev_dot_q2_16(q2, q8, shift);
-                d = sc[is++] & 0x0f;
-                isum[p] += d * dev_dot_q2_16(q2 + 16, q8 + 16, shift);
-                shift += 2;
-                q8 += 32;
+    // Outer loop K, inner loop P: decodes the q2 weight block once and
+    // amortizes that work across all `n` activation pairs (the original
+    // had P outside K, re-traversing x->qs n times). Saves ~7x q2
+    // pointer walking + sc[] table indexing for n=8.
+    const uint8_t *q2_base = x->qs;
+    int is = 0;
+    int q8_off = 0;
+    #pragma unroll
+    for (int k = 0; k < CUDA_QK_K / 128; k++) {
+        const uint8_t *q2 = q2_base + (uint32_t)k * 32u;
+        int shift = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int d_lo = sc[is++] & 0x0f;
+            const int d_hi = sc[is++] & 0x0f;
+            #pragma unroll 8
+            for (uint32_t p = 0; p < n; p++) {
+                const int8_t *q8 = ys[p]->qs + q8_off;
+                isum[p] += d_lo * dev_dot_q2_16(q2, q8, shift);
+                isum[p] += d_hi * dev_dot_q2_16(q2 + 16, q8 + 16, shift);
             }
-            q2 += 32;
+            shift += 2;
+            q8_off += 32;
         }
     }
+    #pragma unroll 8
     for (uint32_t p = 0; p < n; p++) {
         const float yd = ys[p]->d;
         acc[p] += yd * xd * (float)isum[p] - yd * xmin * (float)summs[p];
