@@ -9884,6 +9884,240 @@ __global__ __launch_bounds__(32, 16) static void moe_gate_up_mid_expert_wmma_ker
         }
     }
 }
+
+// Multi-warp WMMA-based prefill MoE gate+up kernel for gfx1151.
+//
+// Fixes the single-warp version's per-block overhead by using 8 warps per
+// block (256 threads), each handling its own 16-row M-tile within a
+// 128-row block. The activation dequant is done by ONE warp and shared
+// in LDS across all 8 warps (since all warps see the same 16 pairs);
+// weight dequant is per-warp on its own 16 rows.
+//
+// Per K sub-block of 32 elements:
+//   * Warp 0 dequantizes the 16 pairs × 32 K activations once into a
+//     shared act_lds slot.
+//   * Each warp dequantizes its 16 rows × 32 K of GATE and UP weights
+//     into per-warp gate_w_lds / up_w_lds slots.
+//   * __syncthreads.
+//   * Each warp issues 4 v_wmma_f32_16x16x16_f16 (gate K[0..15], gate
+//     K[16..31], up K[0..15], up K[16..31]) accumulating into its
+//     per-warp FP32 fragments.
+//   * __syncthreads (so next iter's act_lds write doesn't race).
+//
+// After all K-blocks: each warp stores its accumulators, applies
+// SiLU(gate)*up*routing_weight + clamp, and scatters its 16-row × 16-pair
+// slice of mid_out (and optional gate_out / up_out).
+//
+// LDS budget per block:
+//   gate_w_lds_all + up_w_lds_all:  2 × 8 × 16 × 32 × 2 B = 16 KB
+//   act_lds:                        16 × 32 × 2 B = 1 KB
+//   iq2 grid + signs:               2 KB + 128 B = ~2.2 KB
+//   c-staging (gate + up):          2 × 8 × 16 × 16 × 4 B = 16 KB
+//   ----
+//   ~35 KB per block (with c-staging overlapping the w_lds at the end,
+//   peak ~32 KB) — comfortably fits 2 blocks/CU on the 64 KB LDS budget.
+__global__ __launch_bounds__(256, 2) static void moe_gate_up_mid_expert_wmma_mw_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    namespace wmma = ::rocwmma;
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    const uint32_t warp = threadIdx.x >> 5u;     // 0..7
+    const uint32_t lane = threadIdx.x & 31u;     // 0..31
+    const uint32_t row_base = blockIdx.x * 128u + warp * 16u;
+    const bool warp_active = row_base < expert_mid_dim;
+    const uint32_t rows_active = warp_active
+        ? ((row_base + 16u <= expert_mid_dim) ? 16u : (expert_mid_dim - row_base))
+        : 0u;
+
+    // Resolve pairs (tile8: up to 8)
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t np = 0;
+    const uint32_t expert_count = counts[expert];
+    const uint32_t expert_offset = offsets[expert];
+    for (; np < 8u; np++) {
+        const uint32_t lp = local_start + np;
+        if (lp >= expert_count) break;
+        pair[np] = sorted_pairs[expert_offset + lp];
+        tok[np] = pair[np] / n_expert;
+        slot[np] = pair[np] - tok[np] * n_expert;
+    }
+    if (np == 0) return;
+
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ __half gate_w_lds_all[8 * 16 * 32];  // [warp][r][k]
+    __shared__ __half up_w_lds_all[8 * 16 * 32];
+    __shared__ __half act_lds[16 * 32];             // [p][k] (col-major B in WMMA)
+    __half *gate_w_lds = &gate_w_lds_all[warp * 16u * 32u];
+    __half *up_w_lds   = &up_w_lds_all[warp * 16u * 32u];
+
+    // Stage LUTs once — distribute across warps.
+    // 256 grid entries / 256 threads = 1 per thread; same for signs (128/256 = first half).
+    if (threadIdx.x < 256u) s_iq2_grid[threadIdx.x] = cuda_iq2xxs_grid[threadIdx.x];
+    if (threadIdx.x < 128u) s_iq2_signs[threadIdx.x] = cuda_ksigns_iq2xs[threadIdx.x];
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_gate, acc_up;
+    wmma::fill_fragment(acc_gate, 0.0f);
+    wmma::fill_fragment(acc_up, 0.0f);
+
+    const cuda_block_iq2_xxs *gr_base =
+        (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes);
+    const cuda_block_iq2_xxs *ur_base =
+        (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes);
+
+    __syncthreads();  // ensure LUTs are visible to all warps
+
+    for (uint32_t cb = 0; cb < xq_blocks; cb++) {
+        #pragma unroll 1
+        for (uint32_t sb = 0; sb < 8u; sb++) {
+            // ---- All warps dequantize 16 pairs × 32 K activations into act_lds ----
+            // 512 elements / 256 threads = 2 elements per thread, all warps participate.
+            // Each thread (256 total) handles e in 0..1 → idx = threadIdx.x * 2 + e.
+            #pragma unroll
+            for (uint32_t e = 0; e < 2u; e++) {
+                const uint32_t idx = threadIdx.x * 2u + e;
+                if (idx < 16u * 32u) {
+                    const uint32_t p = idx / 32u;
+                    const uint32_t k = idx % 32u;
+                    __half v = (__half)0;
+                    if (p < np) {
+                        const cuda_block_q8_K *xqb = xq + (uint64_t)tok[p] * xq_blocks + cb;
+                        const float d_a = xqb->d;
+                        const int8_t q = xqb->qs[sb * 32u + k];
+                        v = __float2half(d_a * (float)q);
+                    }
+                    act_lds[idx] = v;
+                }
+            }
+
+            // ---- This warp dequantizes 16 rows × 32 K of GATE and UP weights ----
+            if (warp_active) {
+                #pragma unroll
+                for (uint32_t e = 0; e < 16u; e++) {
+                    const uint32_t idx = lane * 16u + e;
+                    const uint32_t r = idx / 32u;
+                    const uint32_t k = idx % 32u;
+                    __half gv = (__half)0, uv = (__half)0;
+                    if (r < rows_active) {
+                        const cuda_block_iq2_xxs *gr_p =
+                            (const cuda_block_iq2_xxs *)((const char *)gr_base + (uint64_t)(row_base + r) * gate_row_bytes) + cb;
+                        const cuda_block_iq2_xxs *ur_p =
+                            (const cuda_block_iq2_xxs *)((const char *)ur_base + (uint64_t)(row_base + r) * gate_row_bytes) + cb;
+                        const uint16_t *gq2 = gr_p->qs + sb * 4u;
+                        const uint16_t *uq2 = ur_p->qs + sb * 4u;
+                        const uint32_t g_aux0 = (uint32_t)gq2[0] | ((uint32_t)gq2[1] << 16);
+                        const uint32_t g_aux1 = (uint32_t)gq2[2] | ((uint32_t)gq2[3] << 16);
+                        const uint32_t u_aux0 = (uint32_t)uq2[0] | ((uint32_t)uq2[1] << 16);
+                        const uint32_t u_aux1 = (uint32_t)uq2[2] | ((uint32_t)uq2[3] << 16);
+                        const int32_t g_ls = (int32_t)(2u * (g_aux1 >> 28) + 1u);
+                        const int32_t u_ls = (int32_t)(2u * (u_aux1 >> 28) + 1u);
+                        const float g_d = dev_f16_to_f32(gr_p->d);
+                        const float u_d = dev_f16_to_f32(ur_p->d);
+                        const uint32_t pair_idx = k >> 3;
+                        const uint32_t byte_off = k & 7u;
+                        const uint8_t g_gi = (uint8_t)((g_aux0 >> (pair_idx * 8u)) & 0xffu);
+                        const uint32_t g_si = (g_aux1 >> (pair_idx * 7u)) & 127u;
+                        const uint8_t u_gi = (uint8_t)((u_aux0 >> (pair_idx * 8u)) & 0xffu);
+                        const uint32_t u_si = (u_aux1 >> (pair_idx * 7u)) & 127u;
+                        const uint64_t g_grid = s_iq2_grid[g_gi];
+                        const uint64_t u_grid = s_iq2_grid[u_gi];
+                        const uint32_t g_signs = dev_unpack_iq2_signs(s_iq2_signs[g_si]);
+                        const uint32_t u_signs = dev_unpack_iq2_signs(s_iq2_signs[u_si]);
+                        const int8_t g_byte = (int8_t)((g_grid >> (byte_off * 8u)) & 0xffu);
+                        const int8_t u_byte = (int8_t)((u_grid >> (byte_off * 8u)) & 0xffu);
+                        const uint32_t g_sign_bit = (g_signs >> (byte_off * 4u)) & 1u;
+                        const uint32_t u_sign_bit = (u_signs >> (byte_off * 4u)) & 1u;
+                        const int32_t g_val = g_sign_bit ? -(int32_t)g_byte : (int32_t)g_byte;
+                        const int32_t u_val = u_sign_bit ? -(int32_t)u_byte : (int32_t)u_byte;
+                        const float g_scale = 0.125f * g_d * (float)g_ls;
+                        const float u_scale = 0.125f * u_d * (float)u_ls;
+                        gv = __float2half(g_scale * (float)g_val);
+                        uv = __float2half(u_scale * (float)u_val);
+                    }
+                    gate_w_lds[idx] = gv;
+                    up_w_lds[idx] = uv;
+                }
+            }
+
+            __syncthreads();  // ensure all weights and activations are visible
+
+            if (warp_active) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> ga0, ga1, ua0, ua1;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b0, b1;
+                wmma::load_matrix_sync(ga0, &gate_w_lds[0],  32);
+                wmma::load_matrix_sync(ga1, &gate_w_lds[16], 32);
+                wmma::load_matrix_sync(ua0, &up_w_lds[0],    32);
+                wmma::load_matrix_sync(ua1, &up_w_lds[16],   32);
+                wmma::load_matrix_sync(b0,  &act_lds[0],     32);
+                wmma::load_matrix_sync(b1,  &act_lds[16],    32);
+                wmma::mma_sync(acc_gate, ga0, b0, acc_gate);
+                wmma::mma_sync(acc_gate, ga1, b1, acc_gate);
+                wmma::mma_sync(acc_up,   ua0, b0, acc_up);
+                wmma::mma_sync(acc_up,   ua1, b1, acc_up);
+            }
+
+            __syncthreads();  // act_lds will be overwritten next iter
+        }
+    }
+
+    if (!warp_active) return;
+
+    // ---- Per-warp output: store fragment to LDS in col-major (pair-major) order, then scatter.
+    // Reuse the unused half of gate_w_lds_all / up_w_lds_all (we only need
+    // 16 * 16 = 256 floats = 1 KB per warp). With 8 warps that's 16 KB total.
+    // Use dedicated LDS so the layout is clear.
+    __shared__ float c_gate_lds_all[8 * 16 * 16];
+    __shared__ float c_up_lds_all[8 * 16 * 16];
+    float *c_gate_lds = &c_gate_lds_all[warp * 16u * 16u];
+    float *c_up_lds   = &c_up_lds_all[warp * 16u * 16u];
+    wmma::store_matrix_sync(c_gate_lds, acc_gate, 16, wmma::mem_col_major);
+    wmma::store_matrix_sync(c_up_lds,   acc_up,   16, wmma::mem_col_major);
+
+    #pragma unroll
+    for (uint32_t e = 0; e < 8u; e++) {
+        const uint32_t idx = lane * 8u + e;
+        const uint32_t p = idx / 16u;
+        const uint32_t r = idx % 16u;
+        if (p < np && r < rows_active) {
+            float g = c_gate_lds[p * 16u + r];
+            float u = c_up_lds[p * 16u + r];
+            if (clamp > 1.0e-6f) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + (row_base + r);
+            if (write_aux) {
+                gate_out[off] = g;
+                up_out[off] = u;
+            }
+            mid_out[off] = (g / (1.0f + expf(-g))) * u * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+        }
+    }
+}
 #endif
 
 template <uint32_t ROW_SPAN>
@@ -11430,14 +11664,24 @@ static int routed_moe_launch(
                     }
                 } else if (use_gate_row2048) {
 #ifdef __HIP_PLATFORM_AMD__
-                    // gfx1151 WMMA path: 16-row × 16-pair tiles via
-                    // v_wmma_f32_16x16x16_f16. Numerically correct but
-                    // currently SLOWER than the scalar rowspan kernel
-                    // (single-warp-per-block design has too much
-                    // per-block dequant overhead — needs multi-warp
-                    // rewrite to amortize). Off by default; enable via
-                    // DS4_HIP_USE_WMMA_MOE=1 for experimentation.
-                    if (getenv("DS4_HIP_USE_WMMA_MOE") != NULL) {
+                    // gfx1151 multi-warp WMMA path (opt-in via
+                    // DS4_HIP_USE_WMMA_MOE_MW=1). 8 warps per 256-thread
+                    // block, each handling a 16-row × 16-pair tile of one
+                    // expert. Activations and weights are dequantized in
+                    // parallel across all warps. Numerically correct but
+                    // ~2× slower than scalar — the IQ2_XXS dequant phase
+                    // overhead dominates regardless of how the work is
+                    // sliced. See ds4-rocm_report.md § 3.6.
+                    if (getenv("DS4_HIP_USE_WMMA_MOE_MW") != NULL) {
+                        dim3 tgrid((expert_mid_dim + 127u) / 128u, tile_capacity, 1);
+                        moe_gate_up_mid_expert_wmma_mw_kernel<<<tgrid, 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            write_gate_up, clamp);
+                    } else if (getenv("DS4_HIP_USE_WMMA_MOE_SW") != NULL) {
+                        // Legacy single-warp WMMA design — kept for comparison.
                         dim3 tgrid((expert_mid_dim + 15u) / 16u, tile_capacity, 1);
                         moe_gate_up_mid_expert_wmma_kernel<<<tgrid, 32>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
