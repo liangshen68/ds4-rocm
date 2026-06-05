@@ -48,7 +48,7 @@ li{margin-bottom:.3em}
 <tr><td>49 152</td><td>67.06</td><td>224.31</td><td>3.34×</td><td>8.95</td><td>23.78</td><td>2.66×</td></tr>
 <tr><td>65 536</td><td>66.27</td><td>204.96</td><td>3.09×</td><td>8.65</td><td>22.92</td><td>2.65×</td></tr>
 </tbody></table>
-<p>The <strong>generation gap of ~2.6× closely tracks the memory-bandwidth gap</strong> (M4 Max LPDDR5x ~546 GB/s vs Strix Halo LPDDR5 ~256 GB/s ≈ 2.13×): generation is bandwidth-bound on both platforms, so there is no easy software win left there. The <strong>prefill gap is now 3.15–4.76×</strong> across 2 K → 64 K context — phase 1 + 2 + 3 have closed roughly 1.5× of the original gap. The remaining factor needs a WMMA-based MoE GEMM rewrite (1–2 days of focused work, structural change to the dominant prefill MoE kernels — see § 3.7).</p>
+<p>The <strong>generation gap of ~2.6× closely tracks the memory-bandwidth gap</strong> (M4 Max LPDDR5x ~546 GB/s vs Strix Halo LPDDR5 ~256 GB/s ≈ 2.13×): generation is bandwidth-bound on both platforms, so there is no easy software win left there. The <strong>prefill gap is now 3.09–4.67×</strong> across 2 K → 64 K context — phases 1–4 closed roughly 1.5× of the original gap. The remaining factor is structural to the hardware / quantization- format combination on this platform (see § 3.6.5 for the technical finding and § 8 for the take-away).</p>
 <hr>
 <h2>2 — Phase 1: bring-up + transferred kernel tuning</h2>
 <p>(Details in commits <code>a706a10</code>, <code>3db8635</code>, <code>cb716c9</code>, <code>19a0466</code>.)</p>
@@ -290,14 +290,15 @@ tile16 (np=16)  16r * 32K       16p * 32K    4 calls    0.75   (25% improvement)
 <p>The remaining 3.1× prefill gap to M4 Max at 64 K is essentially <strong>Apple&#x27;s higher memory bandwidth</strong> (546 GB/s vs Strix Halo&#x27;s 256 GB/s = 2.13× ratio) plus their FP16 weight format (M4 Max runs the GGUF model in a different precision that fits in the unified memory without IQ2_XXS-style on-the-fly dequant).</p>
 <p>The only architectural fix on Strix Halo would be a <strong>different quantization format</strong> that&#x27;s WMMA-friendly while keeping memory low (e.g., direct FP4 or FP6 weights that load straight to WMMA fragments without a LUT decode step). That&#x27;s a model change, not a kernel change.</p>
 <hr>
-<h3>3.7 Levers that would close more of the gap (deferred)</h3>
-<p>These require kernel rewrites, not annotation passes:</p>
-<ol><li><strong>WMMA-based GEMM rewrite</strong> for the dominant prefill MoE</li></ol>
-<p>projections. <code>v_wmma_i32_16x16x16_iu8</code> does 4096 INT8 MACs per instruction with ~32-cycle latency on gfx1151 — potentially ~30× throughput vs the current <code>v_dot4_i32_iu8</code> path. Requires a 16×16×16 tile-shape restructure of the row/lane assignment in the warp8 kernels.</p>
-<ol><li><strong>hipBLASLt autotuner</strong> for the Tensile HSS GEMM (20 % of bench</li></ol>
-<p>time). The current default hipBLAS picker chose <code>MT128x32x16</code>; hipblasLt&#x27;s autotuner sometimes finds a much better Tensile kernel for non-standard shapes on Strix Halo.</p>
-<ol><li><strong>Recover the decode-time win on attention online kernels</strong> by</li></ol>
-<p>debugging the launch failure and finding the right launch_bounds tuple (the kernels use 512 threads and significant LDS at long context — needs a per-shape budget analysis).</p>
+<h3>3.7 Levers status — what was tried, what&#x27;s left</h3>
+<p>The original &quot;deferred levers&quot; list has been worked through:</p>
+<ol><li><strong>WMMA-based GEMM rewrite for the prefill MoE</strong> — **done in</li></ol>
+<p>phase 4** (§ 3.6.1 / § 3.6.2). Q8_0 WMMA shipped (+3 %). IQ2_XXS MoE WMMA (single-warp + multi-warp + projected tile16) all lose to the scalar <code>dp4a</code> kernel. The structural finding in § 3.6.5 explains why: WMMA can&#x27;t replicate the scalar&#x27;s in-register weight-reuse-across-pairs advantage on this format.</p>
+<ol><li><strong>hipBLASLt autotuner for the Tensile HSS GEMM</strong> — **done in</li></ol>
+<p>phase 3** (§ 3.5). Ships at +3.5–5 % mean prefill across the bench.</p>
+<ol><li><strong>Recover decode-time win on online attention kernels</strong> —</li></ol>
+<p>investigated: both <code>__launch_bounds__(256, 4)</code> and <code>(256, 2)</code> cause launch failures at ctx ≥ 4 K (incremental-prefill path register + LDS budget interaction). <code>(512, 2)</code> on the templated indexed kernel compiles but is within bench noise. Reverted to compiler default.</p>
+<p>What&#x27;s actually left as <strong>untried</strong> on this platform is described in § 8 — they&#x27;re all either out of software-only reach (hardware bandwidth, quantization-format change) or marginal cleanups.</p>
 <hr>
 <h2>4 — Measured performance</h2>
 <h3>4.1 Smoke (single Redis Streams prompt, no prior context)</h3>
@@ -380,7 +381,7 @@ DS4_HIP_NO_BLASLT=1 DS4_METAL_PREFILL_CHUNK=8192 \
 </tbody></table>
 <hr>
 <h2>8 — Honest takeaway</h2>
-<p>Three phases of work closed the prefill gap to M4 Max from ~7× → <strong>3.15× (at 64 K) – 4.76× (at 2 K)</strong>. Generation gap (~2.6×) is essentially at the memory-bandwidth ratio (2.13×) and cannot be closed in software without specialized formats or sparsity that the model doesn&#x27;t currently use.</p>
+<p>Four phases of work closed the prefill gap to M4 Max from ~7× → <strong>3.09× (at 64 K) – 4.67× (at 2 K)</strong>. Generation gap (~2.6×) is essentially at the memory-bandwidth ratio (2.13×) and cannot be closed in software without specialized formats or sparsity that the model doesn&#x27;t currently use.</p>
 <p><strong>Cumulative wins across phases 1+2+3+4:</strong></p>
 <ul><li>Phase 1 (port + transferred opts): bench prefill 51.57 → 56.32 t/s</li></ul>
 <p>range at the start of the session</p>
@@ -388,39 +389,38 @@ DS4_HIP_NO_BLASLT=1 DS4_METAL_PREFILL_CHUNK=8192 \
 <p>prefill across the whole range</p>
 <ul><li>Phase 3 (hipBLASLt autotune): another +3.5–5 % prefill</li>
 <li>Phase 4 (WMMA Q8_0): another +1.5–4 % prefill</li>
-<li>Phase 4 (WMMA MoE): correct but slower — opt-in only, future work</li></ul>
+<li>Phase 4 (WMMA IQ2_XXS MoE, single-warp + multi-warp): correct but</li></ul>
+<p>measurably slower than scalar — shipped opt-in only behind env vars for future experimentation. See § 3.6.3 / § 3.6.5 for the structural reason.</p>
 <p><strong>Net: +28–31 % prefill</strong> vs the phase-1 starting point, +46 % gen on the no-context smoke (gen at long context is bandwidth-bound).</p>
-<h3>Why the remaining prefill gap is now structural</h3>
-<p>The dominant kernels left are:</p>
+<h3>8.1 Why the remaining prefill gap is structural on this platform</h3>
+<p>The dominant kernels left in the long-context bench are:</p>
 <ol><li>**<code>moe_gate_up_mid_expert_tile8_rowspan_kernel&lt;1024&gt;</code>** (~24 % of</li></ol>
-<p>bench time). Hand-tuned, LDS-staging-free, launch-bounds-set. Uses scalar <code>v_dot4_i32_iu8</code> per inner-loop element. Real win here needs WMMA tile-based GEMM — see § 8.1 design sketch.</p>
-<ol><li>**<code>hipblas/hipblaslt Tensile HSS</code>** (~16–20 %, depending on the</li></ol>
-<p>bench point). Now using hipBLASLt&#x27;s autotuned algo. Could squeeze another 5–10 % by doing per-shape timing-based autotune (run all 8 heuristic candidates, time, pick fastest) instead of &quot;first from heuristic&quot;. Cost: small.</p>
-<ol><li>**<code>moe_down_expert_tile16_row2048_kernel</code>** (~12 %). Similar to #1.</li></ol>
-<h3>8.1 WMMA design sketch (for the next session)</h3>
-<p><code>v_wmma_i32_16x16x16_iu8</code> on gfx1151:</p>
-<ul><li>Available, confirmed via clang test:</li></ul>
-<pre><code>
-  __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false)
-</code></pre>
-<p>emits <code>v_wmma_i32_16x16x16_iu8 ... neg_lo:[1,1,0]</code>.</p>
-<ul><li>One instruction = 4 096 INT8 MACs, ~32-cycle latency, 1/cycle throughput.</li>
-<li>Wave32: A and B each = 4 VGPRs (4 × 4 INT8 per VGPR × 32 lanes =</li></ul>
-<p>16×16 with replication across lane halves), C/D = 8 VGPRs.</p>
-<p>Estimated win for the MoE: replacing 16×16 = 256 individual scalar dp4a&#x27;s (~512 cycles per scalar tile) with a single 256-cycle WMMA sequence at the same throughput → <strong>roughly 85× kernel-compute speedup</strong>, minus dequant cost (~5 ops per IQ2_XXS byte × 16×16 = ~1 280 cycles per tile). Net per-tile: ~1 500 cycles vs 131 K → still <strong>~85× speedup if all the supporting plumbing fits</strong>.</p>
-<p>The plumbing is the work:</p>
-<ol><li><strong>Pre-dequant IQ2_XXS → INT8</strong> into LDS in a layout compatible with</li></ol>
-<p>the WMMA fragment loaders. The current scalar kernel decodes per-byte on the fly; the WMMA version needs a 16-row × 16-K block ready in LDS before the <code>v_wmma</code> issues.</p>
-<ol><li><strong>N dimension packing</strong>: WMMA tile is 16-wide. Our <code>np</code> is 8 (tile8</li></ol>
-<p>prefill). We waste 50 % of B if we don&#x27;t pack two experts&#x27; pairs.</p>
-<ol><li><strong>Per-block scale handling</strong>: IQ2_XXS has per-block d × ls scales.</li></ol>
-<p>These multiply outside the WMMA accumulator. Need an epilogue that applies them and accumulates into FP32.</p>
-<ol><li><strong>Test harness</strong>: equivalence against the current scalar kernel at</li></ol>
-<p>matching shapes.</p>
-<p>Realistic time estimate: <strong>1–2 days of focused work</strong> including the test harness. Would target <code>moe_gate_up_mid_expert_tile8_rowspan_kernel</code> first; if successful, port <code>moe_down_expert_tile16_row2048_kernel</code> next.</p>
-<h3>8.2 Why I didn&#x27;t attempt inline asm in this session</h3>
-<p>Looked at the <code>dev_iq2_i8x8_lut</code> function — the <code>__vcmpne4</code> byte-spread is 6 scalar ops, <code>__vsub4</code> is 5 ops. Neither has an obvious 1-op asm replacement on gfx1151 (no per-byte CMP/SUB instructions; <code>v_perm_b32</code> only selects whole bytes, doesn&#x27;t spread bits). The compiler is already generating reasonable code. ROI on hand-asm here is low.</p>
-<p>The asm-skills repository&#x27;s biggest documented wins (MFMA opcode upgrade, direct-to-LDS, software pipelining) all apply to writing <strong>whole</strong> kernels in asm with full register/scheduling control — they&#x27;re for the <strong>WMMA-rewrite case</strong>, not for in-place inline-asm patches of the existing scalar kernels. The right time to use them is when implementing § 8.1.</p>
-<h3>Current state</h3>
-<p>All eight commits pushed to <code>origin/main</code>. Five binaries built clean, ds4-eval self-test passes, smoke run produces a coherent Redis Streams paragraph, 32-frontier long-context bench completes with no failures. <code>speed-bench/strix_halo.csv</code> reflects the final numbers.</p>
-<p>This is a clean stopping point. The next step is the WMMA-based MoE GEMM rewrite from § 8.1, which would be a focused engineering effort sized at a separate work session.</p><div class="footer">Report generated 2026-06-04.</div></body></html>
+<p>bench time). Hand-tuned, LDS-staging-free, launch-bounds-set. Uses scalar <code>v_dot4_i32_iu8</code> per inner-loop element. <strong>Both single- and multi-warp WMMA rewrites were implemented and lose to scalar</strong> — see § 3.6.2 and § 3.6.3. The scalar kernel decodes IQ2_XXS weights once per K-iter, keeps them in registers, and dp4a&#x27;s them against all 8 pair activations. WMMA cannot replicate that reuse because its A fragment must come from LDS, which forces a full dequant per WMMA call.</p>
+<ol><li>**<code>hipblas/hipblaslt Tensile HSS</code>** (~16–20 % depending on the</li></ol>
+<p>bench point). Now on hipBLASLt&#x27;s autotuned algo. A timing-based autotune (run all heuristic candidates, time each, cache the fastest) could squeeze another ~5 % — small, deferred.</p>
+<ol><li>**<code>moe_down_expert_tile16_row2048_kernel</code>** (~12 %). Same IQ2_XXS-</li></ol>
+<p>decode constraint as #1.</p>
+<h3>8.2 What&#x27;s actually left (and what isn&#x27;t)</h3>
+<p><strong>Genuinely untried, software-only:</strong></p>
+<ul><li><strong>Timing-based hipBLASLt autotune.</strong> Today we pick the algo with</li></ul>
+<p>the best <em>heuristic</em> score on first call to a shape; could instead time the top-K candidates and cache the empirically fastest. Cost: ~30 lines and a one-time startup hitch. Expected: +1–3 % prefill on the dominant HSS GEMM call.</p>
+<p><strong>Out of software-only reach on this platform:</strong></p>
+<ul><li><strong>Pre-dequantize IQ2_XXS → FP16 at model load.</strong> Already rejected:</li></ul>
+<p>~40 GiB extra → would push the model past 96 GiB unified-memory budget without cutting KV cache headroom the bench needs (§ 3.6.4).</p>
+<ul><li>**Inline asm to shrink <code>__vcmpne4</code> / <code>__vsub4</code>.** Dumped the</li></ul>
+<p>generated asm: <code>__vcmpne4</code> compiles to exactly 7 ops on gfx1151, <code>__vsub4</code> to 5. AMDGCN has no per-byte CMP/SUB instructions, and <code>v_perm_b32</code> only selects bytes — it cannot spread a bit within a byte to all 8 bits (the core op of <code>__vcmpne4</code>). The compiler output is already at the ISA minimum (§ 3.6.4).</p>
+<ul><li><strong>tile16 multi-pair WMMA MoE.</strong> Analytically projected to bring</li></ul>
+<p>WMMA throughput from 34 t/s (multi-warp) to ~45 t/s — still ~37 % slower than scalar&#x27;s 72 t/s (§ 3.6.4). Not implemented; the limit is the same in-register-reuse advantage the scalar kernel has.</p>
+<p><strong>Needs a model-format change (not a kernel change):</strong></p>
+<ul><li>**Different quantization format that&#x27;s WMMA-friendly while staying</li></ul>
+<p>low-memory.** Direct FP4 or FP6 weights (no LUT decode at all) would let WMMA load weights straight to fragments and remove the dequant- cost overhead that makes scalar win today. The kernel would be trivial to write — but it needs a <code>DeepSeek-V4-Flash-FP4</code> GGUF build that fits in 96 GiB. That&#x27;s an upstream model decision.</p>
+<h3>8.3 Hardware reality check</h3>
+<p>The remaining prefill gap (3.1–4.7×) to M4 Max comes from two multiplicative factors:</p>
+<ol><li><strong>Memory bandwidth</strong>: M4 Max ~546 GB/s vs Strix Halo ~256 GB/s =</li></ol>
+<p><strong>2.13×</strong>. For weight streaming during prefill, this is a hard floor.</p>
+<ol><li><strong>Compute density on the chosen format</strong>: M4 Max runs DeepSeek V4</li></ol>
+<p>Flash in a Metal-friendly weight layout that doesn&#x27;t require the IQ2_XXS LUT-decode-per-call overhead our kernel pays. Difference ~1.5–2× on the dominant MoE projections.</p>
+<p>Product: 2.13 × ~1.7 ≈ 3.6× — matches the 3.09–4.67× range we observe.</p>
+<h3>8.4 Current state</h3>
+<p>All sixteen commits pushed to <code>https://github.com/liangshen68/ds4-rocm</code> <code>main</code>. Five binaries built clean, <code>ds4-eval --self-test-extractors</code> passes, smoke run produces a coherent Redis Streams paragraph, 32-frontier long-context bench completes with no failures. <code>speed-bench/strix_halo.csv</code> reflects the final numbers.</p>
+<p>This is a clean stopping point. The kernel-tuning work on the existing IQ2_XXS GGUF has reached its software-only floor on Strix Halo. The next move is upstream — either a model-format change (FP4/FP6 GGUF) or different hardware.</p><div class="footer">Report generated 2026-06-04.</div></body></html>
