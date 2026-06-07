@@ -8316,20 +8316,26 @@ __device__ static float dev_f16_to_f32(uint16_t v) {
 }
 
 __device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
-    const uint32_t p = __popc(v) & 1u;
-    const uint32_t s = v ^ (p << 7u);
-    return s * 0x01010101u;
+    // All cuda_ksigns_iq2xs[] entries are constructed with even total parity
+    // (the MSB is set whenever popcount of the low 7 bits is odd), so the
+    // parity-correction xor is always a no-op for LUT-sourced inputs. Skip it.
+    return v * 0x01010101u;
 }
 
-__device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign, const int8_t *q8, int32_t acc) {
-    const uint32_t signs = dev_unpack_iq2_signs(sign);
-    const int32_t sm0 = __vcmpne4(signs & 0x08040201u, 0);
-    const int32_t sm1 = __vcmpne4(signs & 0x80402010u, 0);
+// Variant that accepts a pre-broadcast sign word (caller looked it up in
+// cuda_ksigns_iq2xs_b32 / LDS staged from same). No per-call multiply.
+__device__ __forceinline__ static int32_t dev_iq2_dp4a_8_b32(uint64_t grid, uint32_t signs_b32, const int8_t *q8, int32_t acc) {
+    const int32_t sm0 = __vcmpne4(signs_b32 & 0x08040201u, 0);
+    const int32_t sm1 = __vcmpne4(signs_b32 & 0x80402010u, 0);
     const int32_t g0 = __vsub4((int32_t)(uint32_t)grid ^ sm0, sm0);
     const int32_t g1 = __vsub4((int32_t)(uint32_t)(grid >> 32) ^ sm1, sm1);
     acc = __dp4a(g0, *(const int32_t *)(q8 + 0), acc);
     acc = __dp4a(g1, *(const int32_t *)(q8 + 4), acc);
     return acc;
+}
+
+__device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign, const int8_t *q8, int32_t acc) {
+    return dev_iq2_dp4a_8_b32(grid, dev_unpack_iq2_signs(sign), q8, acc);
 }
 
 __device__ static int32_t dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
@@ -8344,19 +8350,19 @@ __device__ static int32_t dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int
 
 __device__ static int32_t dev_dot_iq2_pair_16(uint8_t grid0, uint32_t sign0, uint8_t grid1, uint32_t sign1, const int8_t *q8) {
     int32_t sum = 0;
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid0], cuda_ksigns_iq2xs[sign0], q8, sum);
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid1], cuda_ksigns_iq2xs[sign1], q8 + 8, sum);
+    sum = dev_iq2_dp4a_8_b32(cuda_iq2xxs_grid[grid0], cuda_ksigns_iq2xs_b32[sign0], q8, sum);
+    sum = dev_iq2_dp4a_8_b32(cuda_iq2xxs_grid[grid1], cuda_ksigns_iq2xs_b32[sign1], q8 + 8, sum);
     return sum;
 }
 
 __device__ __forceinline__ static void dev_iq2_i8x8_lut(
         const uint64_t *grid,
-        const uint8_t *signs,
+        const uint32_t *signs_b32,
         uint8_t grid_idx,
         uint32_t sign_idx,
         int32_t *w0,
         int32_t *w1) {
-    const uint32_t s = dev_unpack_iq2_signs(signs[sign_idx]);
+    const uint32_t s = signs_b32[sign_idx];   // already broadcast in LDS / constant
     const int32_t sm0 = __vcmpne4(s & 0x08040201u, 0);
     const int32_t sm1 = __vcmpne4(s & 0x80402010u, 0);
     const uint64_t g = grid[grid_idx];
@@ -8368,7 +8374,7 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
         const cuda_block_iq2_xxs *x,
         const cuda_block_q8_K *y,
         const uint64_t *grid,
-        const uint8_t *signs) {
+        const uint32_t *signs) {
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     const int8_t *q8 = y->qs;
@@ -8434,7 +8440,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         uint32_t n,
         float acc[8],
         const uint64_t *grid,
-        const uint8_t *signs) {
+        const uint32_t *signs) {
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -9162,11 +9168,11 @@ __global__ __launch_bounds__(256, 4) static void moe_gate_up_mid_decode_lut_qwar
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint32_t s_iq2_signs[128];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs_b32[i];
         __syncthreads();
         xqb = sxq;
     }
@@ -9496,7 +9502,7 @@ __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_ro
     __shared__ cuda_block_q8_K sxq[8][16];
 #endif
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint32_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -9519,7 +9525,7 @@ __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_ro
         }
 #endif
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs_b32[i];
         __syncthreads();
 #ifndef DS4_HIP_NO_LDS_STAGING
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
@@ -9590,7 +9596,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint32_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -9611,7 +9617,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
             sxq[p][b] = xqb[p][b];
         }
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs_b32[i];
         __syncthreads();
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
@@ -9727,14 +9733,14 @@ __global__ __launch_bounds__(32, 16) static void moe_gate_up_mid_expert_wmma_ker
     if (np == 0) return;
 
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint32_t s_iq2_signs[128];
     __shared__ __half gate_w_lds[16 * 32];   // 16 rows × 32 K per sub-block iteration
     __shared__ __half up_w_lds[16 * 32];
     __shared__ __half a_lds[16 * 32];        // 16 pairs × 32 K, col-major (pair-major)
 
     // Stage LUTs once.
     for (uint32_t i = lane; i < 256u; i += 32u) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = lane; i < 128u; i += 32u) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    for (uint32_t i = lane; i < 128u; i += 32u) s_iq2_signs[i] = cuda_ksigns_iq2xs_b32[i];
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_gate, acc_up;
     wmma::fill_fragment(acc_gate, 0.0f);
@@ -9799,8 +9805,8 @@ __global__ __launch_bounds__(32, 16) static void moe_gate_up_mid_expert_wmma_ker
                     // Decode grid → 8 INT8 bytes; pick byte_off.
                     const uint64_t g_grid = s_iq2_grid[g_gi];
                     const uint64_t u_grid = s_iq2_grid[u_gi];
-                    const uint32_t g_signs = dev_unpack_iq2_signs(s_iq2_signs[g_si]);
-                    const uint32_t u_signs = dev_unpack_iq2_signs(s_iq2_signs[u_si]);
+                    const uint32_t g_signs = s_iq2_signs[g_si];   // already broadcast in LDS
+                    const uint32_t u_signs = s_iq2_signs[u_si];
                     // Byte b of grid (b=0..7): byte value = ((grid >> (b*8)) & 0xff)
                     // Sign for byte b: if signs has bit b set (using the masks 0x01,0x02,0x04,...,0x80), negate.
                     const int8_t g_byte = (int8_t)((g_grid >> (byte_off * 8u)) & 0xffu);
@@ -9967,7 +9973,7 @@ __global__ __launch_bounds__(256, 2) static void moe_gate_up_mid_expert_wmma_mw_
     if (np == 0) return;
 
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint32_t s_iq2_signs[128];
     __shared__ __half gate_w_lds_all[8 * 16 * 32];  // [warp][r][k]
     __shared__ __half up_w_lds_all[8 * 16 * 32];
     __shared__ __half act_lds[16 * 32];             // [p][k] (col-major B in WMMA)
@@ -9977,7 +9983,7 @@ __global__ __launch_bounds__(256, 2) static void moe_gate_up_mid_expert_wmma_mw_
     // Stage LUTs once — distribute across warps.
     // 256 grid entries / 256 threads = 1 per thread; same for signs (128/256 = first half).
     if (threadIdx.x < 256u) s_iq2_grid[threadIdx.x] = cuda_iq2xxs_grid[threadIdx.x];
-    if (threadIdx.x < 128u) s_iq2_signs[threadIdx.x] = cuda_ksigns_iq2xs[threadIdx.x];
+    if (threadIdx.x < 128u) s_iq2_signs[threadIdx.x] = cuda_ksigns_iq2xs_b32[threadIdx.x];
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_gate, acc_up;
     wmma::fill_fragment(acc_gate, 0.0f);
@@ -10044,8 +10050,8 @@ __global__ __launch_bounds__(256, 2) static void moe_gate_up_mid_expert_wmma_mw_
                         const uint32_t u_si = (u_aux1 >> (pair_idx * 7u)) & 127u;
                         const uint64_t g_grid = s_iq2_grid[g_gi];
                         const uint64_t u_grid = s_iq2_grid[u_gi];
-                        const uint32_t g_signs = dev_unpack_iq2_signs(s_iq2_signs[g_si]);
-                        const uint32_t u_signs = dev_unpack_iq2_signs(s_iq2_signs[u_si]);
+                        const uint32_t g_signs = s_iq2_signs[g_si];   // already broadcast in LDS
+                        const uint32_t u_signs = s_iq2_signs[u_si];
                         const int8_t g_byte = (int8_t)((g_grid >> (byte_off * 8u)) & 0xffu);
                         const int8_t u_byte = (int8_t)((u_grid >> (byte_off * 8u)) & 0xffu);
                         const uint32_t g_sign_bit = (g_signs >> (byte_off * 4u)) & 1u;
@@ -10156,7 +10162,7 @@ __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_ro
     __shared__ cuda_block_q8_K sxq[8][16];
 #endif
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint32_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -10179,7 +10185,7 @@ __global__ __launch_bounds__(256, 1) static void moe_gate_up_mid_expert_tile8_ro
         }
 #endif
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs_b32[i];
         __syncthreads();
 #ifndef DS4_HIP_NO_LDS_STAGING
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
