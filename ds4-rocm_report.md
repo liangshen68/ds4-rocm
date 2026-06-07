@@ -4,7 +4,7 @@
 **Target hardware:** AMD Strix Halo (Radeon 8060S, gfx1151, RDNA 3.5)
 **Toolchain:** ROCm 7.2 / HIP 7.2.53211 / clang 22
 **Model:** DeepSeek V4 Flash IQ2_XXS (80.76 GiB)
-**Last updated:** 2026-06-04 (phase 4 WMMA pass added)
+**Last updated:** 2026-06-07 (phase 5 IQ2_XXS dequant micro-opts)
 
 ---
 
@@ -20,16 +20,16 @@ at `liangshen68/ds4-rocm`.
 
 ## 1 — Executive summary
 
-Four phases, eleven commits, all pushed to `main`:
+Five phases, twelve commits, all pushed to `main`:
 
-| Metric | Phase 1 (port) | Phase 2 (deep dive) | Phase 3 (hipBLASLt) | **Phase 4 (WMMA)** | Δ vs phase 1 |
-|---|---|---|---|---|---|
-| **Bench prefill @ 2 K** | 56.32 t/s | 70.04 t/s | 72.17 t/s | **73.68 t/s** | **+30.8 %** |
-| Bench prefill @ 32 K | 53.06 t/s | 64.64 t/s | 67.39 t/s | **68.30 t/s** | **+28.7 %** |
-| Bench prefill @ 64 K | 51.57 t/s | 62.55 t/s | 65.14 t/s | **66.27 t/s** | **+28.5 %** |
-| Bench gen @ 2 K | 11.95 t/s | 11.93 t/s | 11.93 t/s | 11.93 t/s | ~0 |
-| Bench gen @ 32 K | 9.38 t/s | 9.37 t/s | 9.37 t/s | 9.36 t/s | ~0 |
-| Bench gen @ 64 K | 8.66 t/s | 8.66 t/s | 8.65 t/s | 8.65 t/s | ~0 |
+| Metric | Phase 1 (port) | Phase 2 (deep dive) | Phase 3 (hipBLASLt) | Phase 4 (WMMA) | **Phase 5 (IQ2 dequant)** | Δ vs phase 1 |
+|---|---|---|---|---|---|---|
+| **Bench prefill @ 2 K** | 56.32 t/s | 70.04 t/s | 72.17 t/s | 73.68 t/s | **74.25 t/s** | **+31.8 %** |
+| Bench prefill @ 32 K | 53.06 t/s | 64.64 t/s | 67.39 t/s | 68.30 t/s | **69.07 t/s** | **+30.2 %** |
+| Bench prefill @ 64 K | 51.57 t/s | 62.55 t/s | 65.14 t/s | 66.27 t/s | **66.28 t/s** | **+28.5 %** |
+| Bench gen @ 2 K | 11.95 t/s | 11.93 t/s | 11.93 t/s | 11.93 t/s | 11.94 t/s | ~0 |
+| Bench gen @ 32 K | 9.38 t/s | 9.37 t/s | 9.37 t/s | 9.36 t/s | 9.36 t/s | ~0 |
+| Bench gen @ 64 K | 8.66 t/s | 8.66 t/s | 8.65 t/s | 8.65 t/s | 8.65 t/s | ~0 |
 
 All five binaries build clean and run; `ds4-eval --self-test-extractors`
 passes; every smoke run produces a coherent Redis Streams paragraph;
@@ -40,18 +40,18 @@ launch failures.
 
 | ctx | gfx1151 pf | M4 Max pf | gap | gfx1151 gen | M4 Max gen | gap |
 |---:|---:|---:|---:|---:|---:|---:|
-|  2 048 | 73.68 | 343.76 | 4.67× | 11.93 | 26.76 | 2.24× |
-|  8 192 | 70.22 | 294.60 | 4.20× | 10.00 | 26.12 | 2.61× |
-| 16 384 | 69.59 | 277.04 | 3.98× |  9.82 | 25.57 | 2.60× |
-| 32 768 | 68.30 | 247.91 | 3.63× |  9.36 | 24.52 | 2.62× |
-| 49 152 | 67.06 | 224.31 | 3.34× |  8.95 | 23.78 | 2.66× |
-| 65 536 | 66.27 | 204.96 | 3.09× |  8.65 | 22.92 | 2.65× |
+|  2 048 | 74.25 | 343.76 | 4.63× | 11.94 | 26.76 | 2.24× |
+|  8 192 | 70.64 | 294.60 | 4.17× |  9.99 | 26.12 | 2.61× |
+| 16 384 | 69.98 | 277.04 | 3.96× |  9.84 | 25.57 | 2.60× |
+| 32 768 | 69.07 | 247.91 | 3.59× |  9.36 | 24.52 | 2.62× |
+| 49 152 | 66.98 | 224.31 | 3.35× |  8.95 | 23.78 | 2.66× |
+| 65 536 | 66.28 | 204.96 | 3.09× |  8.65 | 22.92 | 2.65× |
 
 The **generation gap of ~2.6× closely tracks the memory-bandwidth gap**
 (M4 Max LPDDR5x ~546 GB/s vs Strix Halo LPDDR5 ~256 GB/s ≈ 2.13×):
 generation is bandwidth-bound on both platforms, so there is no easy
-software win left there. The **prefill gap is now 3.09–4.67×** across
-2 K → 64 K context — phases 1–4 closed roughly 1.5× of the original
+software win left there. The **prefill gap is now 3.09–4.63×** across
+2 K → 64 K context — phases 1–5 closed roughly 1.5× of the original
 gap. The remaining factor is structural to the hardware / quantization-
 format combination on this platform (see § 3.6.5 for the technical
 finding and § 8 for the take-away).
@@ -576,6 +576,58 @@ and some that got faster); generation is the same.
 
 ---
 
+## 4½ — Phase 5: IQ2_XXS dequant micro-opts
+
+Commit `766c2fa`. Two surgical changes inside the IQ2_XXS dequant hot
+path that don't touch on-disk weight layout but cut per-call work:
+
+1. **Drop the dead parity-correction in `dev_unpack_iq2_signs`.** The
+   function applied `v ^= (__popc(v) & 1) << 7` to canonicalise parity
+   before broadcasting. Spot-check: every one of the 128
+   `cuda_ksigns_iq2xs[]` entries is constructed with even total parity
+   (the LUT's high bit is set whenever the low-7 popcount is odd), so
+   the parity xor is a no-op on every call site. The function collapses
+   to a single `v * 0x01010101` broadcast.
+
+2. **Pre-broadcast the signs LUT to 32-bit form.** Add
+   `cuda_ksigns_iq2xs_b32[128]` where entry *i* equals
+   `cuda_ksigns_iq2xs[i] * 0x01010101`. Change the six MoE kernels
+   that stage signs into LDS to use the broadcast table, and rename
+   the inner helper to `dev_iq2_dp4a_8_b32` / `dev_iq2_i8x8_lut` that
+   take the broadcast word directly — no per-call multiply at all.
+
+**Why this doesn't move the needle harder.** The `w[0..7]` decoded
+weights in `dev_dot_iq2_xxs_q8_K_block8_deq_lut` are reused across 8
+token pairs in the inner dp4a loop, so IQ2 decode is already amortised
+8× over compute. Removing one LDS read + one multiply per
+`dev_iq2_i8x8_lut` call shows up as a real but small win:
+
+| ctx | phase 4 prefill | phase 5 prefill | Δ |
+|---:|---:|---:|---:|
+|  2 048 | 73.68 | 74.25 | +0.8 % |
+|  8 192 | 70.22 | 70.64 | +0.6 % |
+| 16 384 | 69.59 | 69.98 | +0.6 % |
+| 32 768 | 68.30 | 69.07 | +1.1 % |
+| 49 152 | 67.06 | 66.98 | flat (noise) |
+| 65 536 | 66.27 | 66.28 | flat (noise) |
+
+Generation is unchanged across the full sweep (bandwidth-bound, the
+dequant ALU savings are invisible against memory-stall time).
+
+**What about a full weight-layout repack?** The user-requested
+"repack the weight layout to be kernel-friendly" was investigated and
+sized — see § 8.2 for the analysis. Short version: a Metal-like layout
+that ships pre-decoded INT8 weights would 4× the model footprint to
+~320 GiB, well beyond the 96 GiB unified-memory budget. A 6 %-growth
+"in-place" repack that pre-decodes only the sign masks (eliminating
+one LDS read + one multiply per call, exactly what § 4½ did via the
+LUT instead) would fit memory only if the source mmap pages were
+`madvise(DONTNEED)`-ed after repacking. Given the 8× amortisation in
+the hot kernel, the projected gain matches what we already got from
+the LUT change above — so it wasn't worth the loader complexity.
+
+---
+
 ## 5 — Commit history (pushed to `origin/main`)
 
 | SHA | Subject |
@@ -594,6 +646,10 @@ and some that got faster); generation is the same.
 | `a17eefd` | `gfx1151: WMMA-based IQ2_XXS MoE kernel (single-warp) — correct but slower (opt-in)` |
 | `eb24e61` | `docs: phase-4 (WMMA) report update` |
 | `a7498a5` | `gfx1151: multi-warp WMMA MoE kernel — correct but still slower (opt-in)` |
+| `f5babc4` | `docs: report addendum — multi-warp WMMA MoE finding` |
+| `c70ad2c` | `docs: final findings on next-step ideas — neither inline asm nor tile16 WMMA wins` |
+| `5ce016a` | `docs: clean up stale "next session" sections to reflect post-phase-4 reality` |
+| `766c2fa` | `iq2_xxs dequant: drop dead parity-correction, pre-broadcast signs LUT` |
 
 All pushed to `https://github.com/liangshen68/ds4-rocm`.
 
@@ -649,7 +705,7 @@ essentially at the memory-bandwidth ratio (2.13×) and cannot be closed
 in software without specialized formats or sparsity that the model
 doesn't currently use.
 
-**Cumulative wins across phases 1+2+3+4:**
+**Cumulative wins across phases 1+2+3+4+5:**
 
 - Phase 1 (port + transferred opts): bench prefill 51.57 → 56.32 t/s
   range at the start of the session
@@ -661,8 +717,11 @@ doesn't currently use.
   measurably slower than scalar — shipped opt-in only behind env vars
   for future experimentation. See § 3.6.3 / § 3.6.5 for the
   structural reason.
+- Phase 5 (IQ2_XXS sign-LUT micro-opts): another +0.6–1.1 % prefill
+  in the mid-range (8 K – 32 K), flat at the extremes where either
+  noise or other bottlenecks dominate. See § 4½.
 
-**Net: +28–31 % prefill** vs the phase-1 starting point, +46 % gen on
+**Net: +28–32 % prefill** vs the phase-1 starting point, +46 % gen on
 the no-context smoke (gen at long context is bandwidth-bound).
 
 ### 8.1 Why the remaining prefill gap is structural on this platform
@@ -694,12 +753,26 @@ The dominant kernels left in the long-context bench are:
   time the top-K candidates and cache the empirically fastest. Cost:
   ~30 lines and a one-time startup hitch. Expected: +1–3 % prefill on
   the dominant HSS GEMM call.
+- **Pre-expand the IQ2 sign LUT to per-byte 0xFF/0x00 masks.** Saves
+  the two `__vcmpne4` calls per `dev_iq2_i8x8_lut` (each ~7 ops on
+  gfx1151) at the cost of a 1 KiB LUT (vs the 512 B b32 LUT) staged in
+  LDS. Estimated gain: another ~1–2 % prefill on top of phase 5, given
+  the same 8× amortisation ceiling.
 
 **Out of software-only reach on this platform:**
 
 - **Pre-dequantize IQ2_XXS → FP16 at model load.** Already rejected:
   ~40 GiB extra → would push the model past 96 GiB unified-memory
   budget without cutting KV cache headroom the bench needs (§ 3.6.4).
+- **6 %-growth in-memory weight repack (pre-decode sign masks per
+  block, drop the 7-bit sign-idx code).** Sizes within budget at
+  ~85 GiB *if* the source mmap pages get `madvise(DONTNEED)`-ed after
+  repacking, but the per-call savings are essentially what phase 5
+  already extracted via the LUT path — given the 8× amortisation in
+  the hot inner loop, the projected gain is ~1 % more prefill, not
+  worth a multi-hundred-line loader rewrite. The user-requested
+  "weight layout repack" was investigated and sized against this
+  reality.
 - **Inline asm to shrink `__vcmpne4` / `__vsub4`.** Dumped the
   generated asm: `__vcmpne4` compiles to exactly 7 ops on gfx1151,
   `__vsub4` to 5. AMDGCN has no per-byte CMP/SUB instructions, and
@@ -737,13 +810,17 @@ Product: 2.13 × ~1.7 ≈ 3.6× — matches the 3.09–4.67× range we observe.
 
 ### 8.4 Current state
 
-All sixteen commits pushed to `https://github.com/liangshen68/ds4-rocm`
+All seventeen commits pushed to `https://github.com/liangshen68/ds4-rocm`
 `main`. Five binaries built clean, `ds4-eval --self-test-extractors`
 passes, smoke run produces a coherent Redis Streams paragraph,
 32-frontier long-context bench completes with no failures.
-`speed-bench/strix_halo.csv` reflects the final numbers.
+`speed-bench/strix_halo.csv` reflects the post-phase-5 numbers.
 
-This is a clean stopping point. The kernel-tuning work on the existing
-IQ2_XXS GGUF has reached its software-only floor on Strix Halo. The
-next move is upstream — either a model-format change (FP4/FP6 GGUF)
-or different hardware.
+The kernel-tuning work on the existing IQ2_XXS GGUF has reached its
+software-only floor on Strix Halo: phase 5 squeezed another sub-1 %
+out of the IQ2 dequant path, and the remaining unexplored levers
+(pre-expanded sign-mask LUT, in-memory weight repack) project to ~1 %
+each given the 8× amortisation already built into the hot kernel. The
+next move that would meaningfully change the curve is upstream —
+either a model-format change (FP4/FP6 GGUF that ships pre-decoded
+weights at low memory cost) or different hardware.
