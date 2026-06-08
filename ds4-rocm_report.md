@@ -616,15 +616,18 @@ dequant ALU savings are invisible against memory-stall time).
 
 **What about a full weight-layout repack?** The user-requested
 "repack the weight layout to be kernel-friendly" was investigated and
-sized — see § 8.2 for the analysis. Short version: a Metal-like layout
-that ships pre-decoded INT8 weights would 4× the model footprint to
-~320 GiB, well beyond the 96 GiB unified-memory budget. A 6 %-growth
-"in-place" repack that pre-decodes only the sign masks (eliminating
-one LDS read + one multiply per call, exactly what § 4½ did via the
-LUT instead) would fit memory only if the source mmap pages were
-`madvise(DONTNEED)`-ed after repacking. Given the 8× amortisation in
-the hot kernel, the projected gain matches what we already got from
-the LUT change above — so it wasn't worth the loader complexity.
+sized — see § 8.2 for the analysis. Short version: Metal runs the
+*same* GGUF with the *same* per-call LUT decode (verified by reading
+`metal/moe.metal`) — there is no Metal-friendly layout to copy. The
+gap is from FP32-vs-int8-dp4a path differences, raw bandwidth (2.13×),
+and AMDGCN's lack of per-byte CMP/SUB primitives (forcing the
+~13-op `vcmpne4 + vsub4` chain), not from weight packing. Pre-decoded
+INT8 weights would 4× the model footprint to ~320 GiB. A 6 %-growth
+"in-place" repack that pre-decodes only the sign masks (one LDS read +
+one multiply per call) would fit memory if the source mmap pages were
+`madvise(DONTNEED)`-ed, but is bounded by the same 8× amortisation
+ceiling in the hot kernel and projects to ~1 % — exactly what § 4½
+already got from the LUT pre-broadcast.
 
 ---
 
@@ -801,12 +804,28 @@ multiplicative factors:
 1. **Memory bandwidth**: M4 Max ~546 GB/s vs Strix Halo ~256 GB/s =
    **2.13×**. For weight streaming during prefill, this is a hard
    floor.
-2. **Compute density on the chosen format**: M4 Max runs DeepSeek V4
-   Flash in a Metal-friendly weight layout that doesn't require the
-   IQ2_XXS LUT-decode-per-call overhead our kernel pays. Difference
-   ~1.5–2× on the dominant MoE projections.
+2. **Compute density on the chosen format**: M4 Max runs the *same*
+   IQ2_XXS GGUF (verified by inspecting `metal/moe.metal:639–645` —
+   identical `block_iq2_xxs` struct, identical 256-entry grid LUT,
+   identical 128-entry signs LUT, identical per-byte sign-mask test).
+   The compute-side gap is not from weight layout but from:
+   (a) Metal keeps activations in FP32 and does `float * uchar * sign`
+       in the inner loop — no `vcmpne4/vsub4` reconstruction tax,
+       Apple GPUs have huge FP32 throughput and a branch-free
+       sign-flip;
+   (b) our HIP kernel pre-quantises activations to Q8_K and uses
+       `__dp4a`, which is ALU-efficient per instruction but pays the
+       AMDGCN-specific ~13-op `vcmpne4 + vsub4` chain per 4-byte
+       chunk because gfx1151 has no per-byte CMP/SUB primitives;
+   (c) raw GPU compute density and software-stack maturity.
+   Difference ~1.5–2× on the dominant MoE projections.
 
-Product: 2.13 × ~1.7 ≈ 3.6× — matches the 3.09–4.67× range we observe.
+Product: 2.13 × ~1.7 ≈ 3.6× — matches the 3.09–4.63× range we observe.
+
+Correction note: an earlier version of this report attributed the
+compute-side gap to a "Metal-friendly weight layout." That was wrong
+on inspection — the GGUF is byte-identical on both platforms; the
+real driver is items (a)–(c) above.
 
 ### 8.4 Current state
 

@@ -836,15 +836,18 @@ token pairs in the inner dp4a loop, so IQ2 decode is already amortised
 dequant ALU savings are invisible against memory-stall time).</p>
 <p><strong>What about a full weight-layout repack?</strong> The user-requested
 "repack the weight layout to be kernel-friendly" was investigated and
-sized — see § 8.2 for the analysis. Short version: a Metal-like layout
-that ships pre-decoded INT8 weights would 4× the model footprint to
-~320 GiB, well beyond the 96 GiB unified-memory budget. A 6 %-growth
-"in-place" repack that pre-decodes only the sign masks (eliminating
-one LDS read + one multiply per call, exactly what § 4½ did via the
-LUT instead) would fit memory only if the source mmap pages were
-<code>madvise(DONTNEED)</code>-ed after repacking. Given the 8× amortisation in
-the hot kernel, the projected gain matches what we already got from
-the LUT change above — so it wasn't worth the loader complexity.</p>
+sized — see § 8.2 for the analysis. Short version: Metal runs the
+<em>same</em> GGUF with the <em>same</em> per-call LUT decode (verified by reading
+<code>metal/moe.metal</code>) — there is no Metal-friendly layout to copy. The
+gap is from FP32-vs-int8-dp4a path differences, raw bandwidth (2.13×),
+and AMDGCN's lack of per-byte CMP/SUB primitives (forcing the
+~13-op <code>vcmpne4 + vsub4</code> chain), not from weight packing. Pre-decoded
+INT8 weights would 4× the model footprint to ~320 GiB. A 6 %-growth
+"in-place" repack that pre-decodes only the sign masks (one LDS read +
+one multiply per call) would fit memory if the source mmap pages were
+<code>madvise(DONTNEED)</code>-ed, but is bounded by the same 8× amortisation
+ceiling in the hot kernel and projects to ~1 % — exactly what § 4½
+already got from the LUT pre-broadcast.</p>
 <hr />
 <h2>5 — Commit history (pushed to <code>origin/main</code>)</h2>
 <table>
@@ -1092,12 +1095,27 @@ multiplicative factors:</p>
 <li><strong>Memory bandwidth</strong>: M4 Max ~546 GB/s vs Strix Halo ~256 GB/s =
    <strong>2.13×</strong>. For weight streaming during prefill, this is a hard
    floor.</li>
-<li><strong>Compute density on the chosen format</strong>: M4 Max runs DeepSeek V4
-   Flash in a Metal-friendly weight layout that doesn't require the
-   IQ2_XXS LUT-decode-per-call overhead our kernel pays. Difference
-   ~1.5–2× on the dominant MoE projections.</li>
+<li><strong>Compute density on the chosen format</strong>: M4 Max runs the <em>same</em>
+   IQ2_XXS GGUF (verified by inspecting <code>metal/moe.metal:639–645</code> —
+   identical <code>block_iq2_xxs</code> struct, identical 256-entry grid LUT,
+   identical 128-entry signs LUT, identical per-byte sign-mask test).
+   The compute-side gap is not from weight layout but from:
+   (a) Metal keeps activations in FP32 and does <code>float * uchar * sign</code>
+       in the inner loop — no <code>vcmpne4/vsub4</code> reconstruction tax,
+       Apple GPUs have huge FP32 throughput and a branch-free
+       sign-flip;
+   (b) our HIP kernel pre-quantises activations to Q8_K and uses
+       <code>__dp4a</code>, which is ALU-efficient per instruction but pays the
+       AMDGCN-specific ~13-op <code>vcmpne4 + vsub4</code> chain per 4-byte
+       chunk because gfx1151 has no per-byte CMP/SUB primitives;
+   (c) raw GPU compute density and software-stack maturity.
+   Difference ~1.5–2× on the dominant MoE projections.</li>
 </ol>
-<p>Product: 2.13 × ~1.7 ≈ 3.6× — matches the 3.09–4.67× range we observe.</p>
+<p>Product: 2.13 × ~1.7 ≈ 3.6× — matches the 3.09–4.63× range we observe.</p>
+<p>Correction note: an earlier version of this report attributed the
+compute-side gap to a "Metal-friendly weight layout." That was wrong
+on inspection — the GGUF is byte-identical on both platforms; the
+real driver is items (a)–(c) above.</p>
 <h3>8.4 Current state</h3>
 <p>All seventeen commits pushed to <code>https://github.com/liangshen68/ds4-rocm</code>
 <code>main</code>. Five binaries built clean, <code>ds4-eval --self-test-extractors</code>
@@ -1111,4 +1129,4 @@ out of the IQ2 dequant path, and the remaining unexplored levers
 each given the 8× amortisation already built into the hot kernel. The
 next move that would meaningfully change the curve is upstream —
 either a model-format change (FP4/FP6 GGUF that ships pre-decoded
-weights at low memory cost) or different hardware.</p><div class="footer">Report generated 2026-06-07.</div></body></html>
+weights at low memory cost) or different hardware.</p><div class="footer">Report generated 2026-06-08.</div></body></html>
