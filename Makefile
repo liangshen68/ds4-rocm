@@ -26,7 +26,20 @@ METAL_LDLIBS := $(LDLIBS)
 
 ifeq ($(GPU_BACKEND),rocm)
 # ROCm / HIP toolchain for AMD GPUs (e.g. gfx1151 Strix Halo).
-ROCM_PATH ?= /opt/rocm
+# Auto-detect the ROCm install so both the classic /opt/rocm layout and the
+# newer pip "ROCm SDK" wheel (_rocm_sdk_devel under site-packages) work without
+# the user having to set anything. Resolution order:
+#   1) ROCM_PATH if already set in the environment
+#   2) $HIP_PATH (set by the wheel's activation)
+#   3) the rocmpath reported by an on-PATH hipconfig
+#   4) the parent dir of an on-PATH hipcc
+#   5) /opt/rocm as a last-resort default
+ifeq ($(origin ROCM_PATH),undefined)
+ROCM_PATH := $(strip $(or $(HIP_PATH),\
+                          $(shell hipconfig --rocmpath 2>/dev/null),\
+                          $(patsubst %/bin/hipcc,%,$(shell command -v hipcc 2>/dev/null)),\
+                          /opt/rocm))
+endif
 ROCM_ARCH ?= gfx1151
 NVCC := $(ROCM_PATH)/bin/hipcc
 NVCCFLAGS ?= -O3 -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ \

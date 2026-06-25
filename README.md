@@ -32,6 +32,11 @@ git clone https://github.com/liangshen68/ds4-rocm
 cd ds4-rocm
 make rocm ROCM_ARCH=gfx1151     # builds ds4, ds4-server, ds4-bench, ds4-eval, ds4-agent
 
+# Make the runtime find the rocBLAS / hipBLASLt kernel libraries regardless
+# of how ROCm was installed (classic /opt/rocm OR the pip "ROCm SDK" wheels).
+# No-op on /opt/rocm; required for the wheel layout — see note below.
+source scripts/rocm-env.sh
+
 # Inference
 ./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
       -p "Explain Redis streams in one paragraph."
@@ -41,6 +46,20 @@ make rocm ROCM_ARCH=gfx1151     # builds ds4, ds4-server, ds4-bench, ds4-eval, d
 ./ds4-bench -m gguf/<MODEL>.gguf --prompt-file speed-bench/promessi_sposi.txt \
             --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128
 ```
+
+> **ROCm install layouts.** The build auto-detects `ROCM_PATH` (it honours an
+> exported `ROCM_PATH`/`HIP_PATH`, else falls back to `hipconfig`/`hipcc` on
+> `PATH`, else `/opt/rocm`), so `make rocm` works on both a classic
+> `/opt/rocm` install and the newer pip **ROCm SDK** wheels (`pip install
+> rocm[libraries,devel]`, layout `…/site-packages/_rocm_sdk_devel`).
+>
+> The wheels split the rocBLAS / hipBLASLt **Tensile kernel libraries** into a
+> separate `_rocm_sdk_libraries` wheel that the runtime does not search by
+> default — without help, ds4 aborts on the first GEMM with
+> `rocBLAS error: Cannot read …/TensileLibrary.dat`. `source
+> scripts/rocm-env.sh` locates those kernel dirs (any layout) and exports
+> `ROCBLAS_TENSILE_LIBPATH` / `HIPBLASLT_TENSILE_LIBPATH`. It is a harmless
+> no-op on a classic `/opt/rocm` install.
 
 For other AMD GPUs (`gfx1100` discrete RDNA3, `gfx1030` RDNA2, etc.) the
 build will likely succeed but the `__launch_bounds__` numbers and the

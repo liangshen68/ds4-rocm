@@ -6492,10 +6492,18 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
 #ifdef __HIP_PLATFORM_AMD__
     // gfx1151 WMMA-based path: 16-row × 16-token tiles via
-    // v_wmma_f32_16x16x16_f16. Gated on env var DS4_HIP_USE_WMMA_Q8 and
-    // shape (rows/tokens both multiples of 16 for full-tile efficiency).
+    // v_wmma_f32_16x16x16_f16. Opt-in via DS4_HIP_USE_WMMA_Q8; shape-gated
+    // (rows/tokens both multiples of 16 for full-tile efficiency).
+    //
+    // This won +3% prefill on ROCm 7.2 / clang 22, but on ROCm 7.14 / clang 23
+    // the kernel's occupancy regresses (the compiler reports desired 16 waves,
+    // final 11 for __launch_bounds__(32,16)) and it becomes a net ~2.6% LOSS
+    // versus the scalar matmul_q8_0_preq_kernel below. Measured on gfx1151,
+    // 2K–35K context. So it is now opt-in rather than default; see § 9 of
+    // ds4-rocm_report.md. Set DS4_HIP_USE_WMMA_Q8=1 to re-enable (e.g. when
+    // benchmarking a future toolchain that fixes the occupancy).
     if (out_dim >= 16 && n_tok >= 16 &&
-        getenv("DS4_HIP_NO_WMMA_Q8") == NULL) {
+        getenv("DS4_HIP_USE_WMMA_Q8") != NULL) {
         dim3 wgrid(((unsigned)out_dim + 15u) / 16u,
                    ((unsigned)n_tok + 15u) / 16u, 1);
         matmul_q8_0_preq_wmma_kernel<<<wgrid, 32>>>(

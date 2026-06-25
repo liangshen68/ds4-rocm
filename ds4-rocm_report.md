@@ -2,9 +2,10 @@
 
 **Repository:** [`liangshen68/ds4-rocm`](https://github.com/liangshen68/ds4-rocm) (fork of [`antirez/ds4@main`](https://github.com/antirez/ds4))
 **Target hardware:** AMD Strix Halo (Radeon 8060S, gfx1151, RDNA 3.5)
-**Toolchain:** ROCm 7.2 / HIP 7.2.53211 / clang 22
+**Toolchain (phases 1–5):** ROCm 7.2 / HIP 7.2.53211 / clang 22 (`/opt/rocm`)
+**Toolchain (phase 6):** ROCm 7.14 / HIP 7.14.60850 / clang 23 (pip ROCm SDK wheels)
 **Model:** DeepSeek V4 Flash IQ2_XXS (80.76 GiB)
-**Last updated:** 2026-06-07 (phase 5 IQ2_XXS dequant micro-opts)
+**Last updated:** 2026-06-25 (phase 6 — ROCm 7.14 upgrade review; see § 9)
 
 ---
 
@@ -665,6 +666,11 @@ git clone https://github.com/liangshen68/ds4-rocm
 cd ds4-rocm
 make rocm ROCM_ARCH=gfx1151                   # builds all 5 binaries
 
+# Make the runtime find the rocBLAS / hipBLASLt Tensile kernel libraries.
+# Required for the pip "ROCm SDK" wheel layout; no-op on classic /opt/rocm.
+# (See § 9 — ROCm 7.14 upgrade.)
+source scripts/rocm-env.sh
+
 # Smoke
 ./ds4 -m gguf/<MODEL>.gguf -p "Explain Redis streams in one paragraph."
 
@@ -681,8 +687,13 @@ DS4_HIP_NO_BLASLT=1 DS4_METAL_PREFILL_CHUNK=8192 \
 ```
 
 Required system packages: ROCm 7.2+ with rocWMMA, hipCUB, hipBLAS,
-**and hipBLASLt** installed under `/opt/rocm` (override with
-`ROCM_PATH=...` if elsewhere). The build links `-lhipblaslt` by default.
+**and hipBLASLt**. Either a classic `/opt/rocm` install or the pip
+**ROCm SDK** wheels (`pip install rocm[libraries,devel]`) works — the
+Makefile auto-detects `ROCM_PATH` (honours an exported `ROCM_PATH`/
+`HIP_PATH`, else `hipconfig`/`hipcc` on `PATH`, else `/opt/rocm`). The
+build links `-lhipblaslt` by default. For the wheel layout you must
+`source scripts/rocm-env.sh` before running so the Tensile kernel
+libraries are found at runtime (see § 9).
 
 ---
 
@@ -843,3 +854,120 @@ each given the 8× amortisation already built into the hot kernel. The
 next move that would meaningfully change the curve is upstream —
 either a model-format change (FP4/FP6 GGUF that ships pre-decoded
 weights at low memory cost) or different hardware.
+
+---
+
+## 9 — Phase 6: ROCm 7.14 / clang 23 upgrade review
+
+The docker image was upgraded from **ROCm 7.2 / clang 22** (installed under
+`/opt/rocm`) to **ROCm 7.14.60850 / HIP 7.14 / clang 23**, delivered as the
+new pip **ROCm SDK** wheels (`rocm-sdk-*`, layout
+`…/site-packages/_rocm_sdk_devel`). This phase re-validates the phases 1–5
+work against the new toolchain. Two things had to be fixed before anything
+ran, one default was flipped, and the bench was regenerated.
+
+### 9.1 Build fix — `ROCM_PATH` auto-detection (Makefile)
+
+The `rocm` target hard-defaulted `ROCM_PATH ?= /opt/rocm`. The wheels live
+under site-packages, so the build only worked if `ROCM_PATH` happened to be
+exported. The Makefile now auto-detects: honour an exported
+`ROCM_PATH`/`HIP_PATH`, else `hipconfig --rocmpath`, else the parent of an
+on-`PATH` `hipcc`, else `/opt/rocm`. `make rocm ROCM_ARCH=gfx1151` now builds
+clean on both layouts. clang 23 builds with no errors (two non-fatal
+occupancy warnings on the opt-in WMMA kernels — see § 9.3).
+
+### 9.2 Runtime fix — the wheels split the Tensile kernel libraries (critical)
+
+This is the headline finding. The pip wheels put the rocBLAS / hipBLASLt
+**Tensile kernel libraries** in a *separate* wheel (`_rocm_sdk_libraries`)
+that the runtime does not search by default. With the classic `/opt/rocm`
+layout these sit next to the `.so`; here they don't, so `ds4` aborts on the
+**first GEMM**:
+
+```
+rocBLAS error: Cannot read .../_rocm_sdk_devel/lib/rocblas/library/TensileLibrary.dat
+rocblaslt error: Cannot read .../hipblaslt/library/TensileLibrary_lazy_gfx1151.dat
+```
+
+Both libraries ship full gfx1151 kernels in `_rocm_sdk_libraries`; rocBLAS
+just needs `ROCBLAS_TENSILE_LIBPATH` and hipBLASLt needs
+`HIPBLASLT_TENSILE_LIBPATH` pointed at them. Note the layouts differ:
+rocBLAS uses a flat `rocblas/library/` dir (per-arch by filename), hipBLASLt
+uses a per-arch **subdir** `hipblaslt/library/gfx1151/`.
+
+Added **`scripts/rocm-env.sh`** — `source` it before running; it locates the
+kernel dirs for any layout and exports both vars. It is a harmless no-op on a
+classic `/opt/rocm` install. README quickstart and § 6 updated to source it.
+
+With this in place: GPU init, the 80.76 GiB model load, smoke (coherent
+Redis Streams paragraph), and the full 32-frontier bench all run clean;
+`ds4-eval --self-test-extractors` passes.
+
+### 9.3 Performance regression found and half-recovered — WMMA Q8_0 default flipped
+
+Re-running the full 32-frontier bench (step 2048, identical command) showed a
+**uniform ~3.6 % prefill regression** vs the ROCm 7.2 numbers in
+`speed-bench/strix_halo.csv`; generation was unchanged (−0.6 %, noise).
+
+Localisation:
+
+- The dominant **scalar MoE kernel is *not* the cause.** Dumping its asm
+  under clang 23 (`moe_gate_up_mid_expert_tile8_rowspan_kernel<1024>`) shows
+  the productive `v_dot4_i32_iu8` count unchanged at 1024 and the dequant ALU
+  chain slightly *leaner* (clang 23 fuses `v_xor3_b32`, fewer `s_waitcnt`).
+  The § 3.6.4 "compiler-optimal / ISA-bound" conclusion still holds.
+- The cause is the **WMMA Q8_0 prefill kernel** (`matmul_q8_0_preq_wmma_kernel`).
+  clang 23 can no longer hit its occupancy target (`__launch_bounds__(32,16)`:
+  *desired 16 waves, final 11* — emitted as a build warning). The kernel that
+  won **+3 % on clang 22 is now a net ~2.6 % loss** versus the scalar path.
+  Ablation (step 8192, 2K–35K), prefill t/s:
+
+  | config | 2 048 | 18 432 | 34 816 |
+  |---|---:|---:|---:|
+  | default (WMMA on, LT on) | 71.11 | 67.14 | 66.03 |
+  | **WMMA off, LT on** | **72.64** | **68.95** | **67.85** |
+  | WMMA off, LT off | 70.37 | 66.68 | 65.69 |
+
+  → **WMMA Q8 off is +2.6 %**; turning hipBLASLt off on top *loses* ~2 %, so
+  **hipBLASLt is still a win under 7.14** (phase 3 holds — keep it on).
+
+**Fix:** the WMMA Q8_0 path is now **opt-in** (`DS4_HIP_USE_WMMA_Q8=1`)
+instead of default-on, matching the already-opt-in IQ2 WMMA kernels and the
+code comment that always *said* it should be opt-in. After the flip, the full
+bench recovers to **−1.8 % mean prefill vs ROCm 7.2** (from −3.6 %):
+
+| ctx | 7.2 (committed) | 7.14 default | **7.14 + fix** | fix vs 7.2 |
+|---:|---:|---:|---:|---:|
+|  2 048 | 74.25 | 71.41 | **72.87** | −1.9 % |
+| 16 384 | 69.98 | 67.19 | **68.47** | −2.2 % |
+| 32 768 | 69.07 | 66.06 | **67.54** | −2.2 % |
+| 49 152 | 66.98 | 65.22 | **66.26** | −1.1 % |
+| 65 536 | 66.28 | 64.13 | **65.29** | −1.5 % |
+
+The residual ~1.8 % is library-level: 7.14's newer rocBLAS/hipBLASLt Tensile
+kernels are marginally slower than 7.2's on these exact (M,N,K) shapes. Not
+worth chasing — it is within Tensile-version variance and may invert on the
+next SDK build. The new numbers are saved at
+`speed-bench/strix_halo_rocm714.csv` (the 7.2 `strix_halo.csv` is kept as the
+baseline for this comparison).
+
+### 9.4 What did NOT change (re-validated under clang 23)
+
+- **Structural conclusions hold:** memory-bandwidth gap to M4 Max (2.13×),
+  IQ2_XXS in-register-reuse advantage of scalar dp4a over WMMA, and the
+  AMDGCN no-per-byte-CMP/SUB limit (`v_perm_b32` count still 0 — the bit
+  spread is a hardware gap, not a compiler one).
+- **hipBLASLt** still helps (~2 %); kept on by default.
+- **Generation** remains bandwidth-bound and unchanged.
+
+### 9.5 Follow-ups left open
+
+- **Re-tune the WMMA Q8 occupancy for clang 23.** `__launch_bounds__(32,16)`
+  is unreachable now; trying `(32,8)` / `(64,…)` or a 2-warp block might let
+  WMMA win again and reclaim the residual + the old +3 %. Needs a kernel
+  experiment, not just an env flag.
+- **Recheck the online-attention `__launch_bounds__` failures** (§ 3.6/§ 3.7)
+  under clang 23 — the register/LDS allocator changed; the hints that crashed
+  on clang 22 may now be safe. Not yet re-tested.
+- **Timing-based hipBLASLt autotune** (§ 8.2) is still unimplemented and is
+  now the most attractive remaining software lever given 7.14's newer algos.
