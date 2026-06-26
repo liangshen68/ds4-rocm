@@ -944,12 +944,13 @@ bench recovers to **−1.8 % mean prefill vs ROCm 7.2** (from −3.6 %):
 | 49 152 | 66.98 | 65.22 | **66.26** | −1.1 % |
 | 65 536 | 66.28 | 64.13 | **65.29** | −1.5 % |
 
-The residual ~1.8 % is library-level: 7.14's newer rocBLAS/hipBLASLt Tensile
-kernels are marginally slower than 7.2's on these exact (M,N,K) shapes. Not
-worth chasing — it is within Tensile-version variance and may invert on the
-next SDK build. The new numbers are saved at
-`speed-bench/strix_halo_rocm714.csv` (the 7.2 `strix_halo.csv` is kept as the
-baseline for this comparison).
+The residual ~1.8 % after the WMMA-Q8 flip is library-level (7.14's newer
+Tensile kernels are marginally slower on these exact shapes). **§ 9.6 then
+closes it and goes further** — an INT8 WMMA rewrite of the same kernel lands
+at **+3.8 % over the ROCm 7.2 baseline**, so the final 7.14 state is *faster*
+than 7.2, not slower. The canonical 7.14 numbers in
+`speed-bench/strix_halo_rocm714.csv` reflect that INT8 default (the 7.2
+`strix_halo.csv` is kept as the comparison baseline).
 
 ### 9.4 What did NOT change (re-validated under clang 23)
 
@@ -962,12 +963,76 @@ baseline for this comparison).
 
 ### 9.5 Follow-ups left open
 
-- **Re-tune the WMMA Q8 occupancy for clang 23.** `__launch_bounds__(32,16)`
-  is unreachable now; trying `(32,8)` / `(64,…)` or a 2-warp block might let
-  WMMA win again and reclaim the residual + the old +3 %. Needs a kernel
-  experiment, not just an env flag.
+- **~~Re-tune the WMMA Q8 occupancy for clang 23.~~** Done — see § 9.6. The
+  occupancy of the *f16* kernel turned out to be untunable (pinned at 97 VGPR
+  by the rocWMMA f16 fragment API, no spills), so the fix was an INT8 WMMA
+  rewrite instead, now the default at **+3.8 % over ROCm 7.2**.
 - **Recheck the online-attention `__launch_bounds__` failures** (§ 3.6/§ 3.7)
   under clang 23 — the register/LDS allocator changed; the hints that crashed
   on clang 22 may now be safe. Not yet re-tested.
 - **Timing-based hipBLASLt autotune** (§ 8.2) is still unimplemented and is
   now the most attractive remaining software lever given 7.14's newer algos.
+
+### 9.6 INT8 WMMA Q8_0 prefill kernel — new default (+3.8 % vs 7.2)
+
+The § 9.5 follow-up "re-tune the WMMA Q8 occupancy" turned into the biggest
+win of this phase. The investigation and result:
+
+**Occupancy is not tunable on the f16 kernel.** The f16 WMMA kernel sits at
+**97 VGPRs → 11 waves/EU**, one register over the 96-VGPR cliff for 16 waves.
+Every source-level lever was tried and *none* moved it: disabling the dequant
+`#pragma unroll`, deleting all boundary-handling registers, and reusing the
+A/B fragments (2 live instead of 4) all stayed at exactly 97. There are **no
+spills** (`private_segment_fixed_size 0`), so the unreachable
+`__launch_bounds__(32,16)` is merely a cosmetic warning, not a perf problem.
+The 97-VGPR floor is intrinsic to the rocWMMA f16 fragment API codegen on
+clang 23. The kernel loses to scalar not because of occupancy but because it
+is **dequant-bound**: 1024 scalar `int8→f16` conversions per K-block, with the
+tensor cores doing only the tiny 16×16 mma.
+
+**The fix — feed raw int8 to the INT8 tensor cores.** gfx1151 has
+`v_wmma_i32_16x16x16_iu8` (INT8 in / INT32 out). The new kernel
+`matmul_q8_0_preq_wmma_i8_kernel` copies the *raw* int8 Q8_0 weights and int8
+activations to LDS (no per-element dequant), runs two int8 `mma_sync` per
+K-block, then applies the Q8_0 scales **once per tile** as an outer product of
+the 16 per-row weight scales and 16 per-token activation scales:
+
+```
+c[t][r] += wscale[r][b] * ascale[t][b] * (float)i32[t][r]
+```
+
+carried in a per-lane FP32 register accumulator across all K-blocks. This is
+the Q8_0 analog of why scalar dp4a wins for IQ2 (keep ints, scale late) — but
+here the tensor cores do the multiply-accumulate.
+
+**Result.** The int8 kernel drops to **68 VGPRs → 15 waves/EU** (the occupancy
+the f16 kernel could never reach) *and* removes the dequant bottleneck:
+
+| kernel | VGPR | waves/EU | prefill vs scalar |
+|---|---:|---:|---:|
+| scalar dp4a (7.14 default) | — | — | baseline |
+| f16 WMMA (old, clang 22's +3 %) | 97 | 11 | −2.6 % |
+| **INT8 WMMA (new default)** | **68** | **15** | **+6.2 %** |
+
+Full 32-frontier sweep, INT8 default vs the ROCm 7.2 baseline and the 7.14
+scalar default:
+
+| ctx | 7.2 | 7.14 scalar | **7.14 INT8** | INT8 vs 7.2 |
+|---:|---:|---:|---:|---:|
+|  2 048 | 74.25 | 72.87 | **77.04** | **+3.8 %** |
+| 16 384 | 69.98 | 68.47 | **72.52** | **+3.6 %** |
+| 32 768 | 69.07 | 67.54 | **71.47** | **+3.5 %** |
+| 49 152 | 66.98 | 66.26 | **69.96** | **+4.4 %** |
+| 65 536 | 66.28 | 65.29 | **68.83** | **+3.8 %** |
+
+Mean **+3.8 % vs ROCm 7.2** (i.e. 7.14 is now *faster* than 7.2, not slower),
+**+5.7 % vs the 7.14 scalar default**. Generation unchanged (int8 path is
+prefill-only; decode has n_tok < 16 and falls through to scalar). Correctness
+verified by smoke (coherent, accurate Redis Streams paragraph — a wrong GEMM
+garbles output) and `--self-test-extractors`.
+
+The int8 kernel is now the **default** prefill path (`out_dim,n_tok ≥ 16`);
+opt out with `DS4_HIP_NO_WMMA_Q8_I8=1`. The f16 WMMA kernel remains opt-in
+(`DS4_HIP_USE_WMMA_Q8=1`) for toolchain comparison. This supersedes the § 9.3
+WMMA-Q8 default flip: that change made scalar the default to *avoid* the f16
+regression; the int8 path is now better than both.

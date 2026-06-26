@@ -2350,6 +2350,131 @@ __global__ __launch_bounds__(32, 16) static void matmul_q8_0_preq_wmma_kernel(
         }
     }
 }
+
+// gfx1151 INT8 WMMA Q8_0 prefill GEMM (v_wmma_i32_16x16x16_iu8).
+//
+// The f16 WMMA kernel above is dequant-bound on clang 23: it converts every
+// int8 weight/activation to FP16 before the mma (1024 conversions per K-block)
+// and the tensor cores only do the tiny 16×16 mma. This variant feeds the RAW
+// int8 weights and activations straight to the INT8 tensor cores and applies
+// the per-block Q8_0 scales ONCE per output tile (an outer product of the
+// 16 per-row weight scales and 16 per-token activation scales), so the
+// expensive per-element dequant disappears.
+//
+// Per K-block: copy raw int8 W (16×32) + int8 A (16×32) to LDS, two int8
+// mma_sync (K=32), store the int32 tile, then accumulate
+//   c[t][r] += wscale[r][b] * ascale[t][b] * (float)i32[t][r]
+// into a per-lane FP32 register accumulator carried across all K-blocks.
+//
+// One warp (32 threads) per 16-row × 16-token tile, same as the f16 kernel.
+__global__ __launch_bounds__(32, 16) static void matmul_q8_0_preq_wmma_i8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    (void)in_dim;
+    namespace wmma = ::rocwmma;
+    const uint32_t row_base = blockIdx.x * 16u;
+    const uint32_t tok_base = blockIdx.y * 16u;
+    if (row_base >= out_dim || tok_base >= n_tok) return;
+    const uint32_t lane = threadIdx.x;  // 0..31
+
+    __shared__ int8_t  w_lds[16 * 32];  // row-major: w_lds[r * 32 + k]
+    __shared__ int8_t  a_lds[32 * 16];  // col-major: a_lds[t * 32 + k]
+    __shared__ int32_t i_lds[16 * 16];  // per-block int32 result, [t * 16 + r]
+    __shared__ float   wsc_lds[16];     // per-row weight scale, this block
+    __shared__ float   asc_lds[16];     // per-token activation scale, this block
+
+    const uint32_t rows_active = (row_base + 16u <= out_dim) ? 16u : (uint32_t)(out_dim - row_base);
+    const uint32_t toks_active = (tok_base + 16u <= n_tok) ? 16u : (uint32_t)(n_tok - tok_base);
+
+    // Per-lane FP32 accumulator: lane owns 8 of the 256 [t*16+r] elements.
+    float c_acc[8];
+    #pragma unroll
+    for (uint32_t e = 0; e < 8u; e++) c_acc[e] = 0.0f;
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        // ---- Copy raw int8 weights (16 rows × 32 K) into w_lds ----
+        #pragma unroll
+        for (uint32_t e = 0; e < 16u; e++) {
+            const uint32_t idx = lane * 16u + e;        // 0..511 covering [16r][32k]
+            const uint32_t r = idx / 32u;               // 0..15
+            const uint32_t k = idx % 32u;               // 0..31
+            int8_t q = 0;
+            if (r < rows_active) {
+                const uint8_t *wrow = w + ((uint64_t)(row_base + r) * blocks + b) * 34u;
+                q = *(const int8_t *)(wrow + 2 + k);
+            }
+            w_lds[idx] = q;
+        }
+        // ---- Copy raw int8 activations (16 tokens × 32 K) into a_lds ----
+        #pragma unroll
+        for (uint32_t e = 0; e < 16u; e++) {
+            const uint32_t idx = lane * 16u + e;        // 0..511 covering [16t][32k]
+            const uint32_t t = idx / 32u;               // 0..15
+            const uint32_t k = idx % 32u;               // 0..31
+            int8_t q = 0;
+            if (t < toks_active) {
+                q = xq[((uint64_t)(tok_base + t) * blocks + b) * 32u + k];
+            }
+            a_lds[idx] = q;
+        }
+        // ---- Load the 16 per-row weight scales + 16 per-token act scales ----
+        if (lane < 16u) {
+            const uint32_t r = lane;
+            float ws = 0.0f;
+            if (r < rows_active) {
+                const uint8_t *wrow = w + ((uint64_t)(row_base + r) * blocks + b) * 34u;
+                ws = __half2float(*(const __half *)wrow);
+            }
+            wsc_lds[r] = ws;
+            const uint32_t t = lane;
+            float as = 0.0f;
+            if (t < toks_active) as = xscale[(uint64_t)(tok_base + t) * blocks + b];
+            asc_lds[t] = as;
+        }
+        __syncwarp();
+
+        // ---- Two INT8 WMMA calls for K[0..15] and K[16..31] ----
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> bf;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> iacc;
+        wmma::fill_fragment(iacc, 0);
+        wmma::load_matrix_sync(af, &w_lds[0],  32);
+        wmma::load_matrix_sync(bf, &a_lds[0],  32);
+        wmma::mma_sync(iacc, af, bf, iacc);
+        wmma::load_matrix_sync(af, &w_lds[16], 32);
+        wmma::load_matrix_sync(bf, &a_lds[16], 32);
+        wmma::mma_sync(iacc, af, bf, iacc);
+
+        // Store int32 tile (col-major → i_lds[t*16+r]) and accumulate scaled.
+        wmma::store_matrix_sync(i_lds, iacc, 16, wmma::mem_col_major);
+        __syncwarp();
+        #pragma unroll
+        for (uint32_t e = 0; e < 8u; e++) {
+            const uint32_t idx = lane * 8u + e;         // 0..255 == [t*16+r]
+            const uint32_t t = idx / 16u;
+            const uint32_t r = idx % 16u;
+            c_acc[e] += wsc_lds[r] * asc_lds[t] * (float)i_lds[idx];
+        }
+        __syncwarp();
+    }
+
+    // ---- Store the 16×16 output tile to global ----
+    #pragma unroll
+    for (uint32_t e = 0; e < 8u; e++) {
+        const uint32_t idx = lane * 8u + e;             // 0..255 == [t*16+r]
+        const uint32_t t = idx / 16u;
+        const uint32_t r = idx % 16u;
+        if (t < toks_active && r < rows_active) {
+            out[(uint64_t)(tok_base + t) * out_dim + (row_base + r)] = c_acc[e];
+        }
+    }
+}
 #endif
 
 __global__ __launch_bounds__(256, 4) static void matmul_q8_0_preq_kernel(
@@ -6491,6 +6616,24 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
     }
 #ifdef __HIP_PLATFORM_AMD__
+    // gfx1151 INT8 WMMA path: feeds raw int8 to v_wmma_i32_16x16x16_iu8 and
+    // applies Q8_0 scales once per tile — no per-element f16 dequant. This is
+    // the DEFAULT prefill path on ROCm 7.14 / clang 23: it uses 68 VGPRs (vs
+    // 97 for the f16 kernel → 15 vs 11 waves/EU) and measures +6.2% prefill
+    // over the scalar dp4a kernel, +~4% over the old f16 WMMA. Same shape gate
+    // as the f16 path. Opt out with DS4_HIP_NO_WMMA_Q8_I8=1. See § 9.6.
+    if (out_dim >= 16 && n_tok >= 16 &&
+        getenv("DS4_HIP_NO_WMMA_Q8_I8") == NULL) {
+        dim3 wgrid(((unsigned)out_dim + 15u) / 16u,
+                   ((unsigned)n_tok + 15u) / 16u, 1);
+        matmul_q8_0_preq_wmma_i8_kernel<<<wgrid, 32>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                xscale,
+                in_dim, out_dim, n_tok, blocks);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 wmma i8 launch");
+    }
     // gfx1151 WMMA-based path: 16-row × 16-token tiles via
     // v_wmma_f32_16x16x16_f16. Opt-in via DS4_HIP_USE_WMMA_Q8; shape-gated
     // (rows/tokens both multiples of 16 for full-tile efficiency).
